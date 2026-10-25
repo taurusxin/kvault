@@ -1,0 +1,52 @@
+[package]
+name = "kvault"
+version = "0.1.0"
+description = "An encrypted, local-first key-value vault"
+authors = ["taurusxin"]
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "kvault_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-clipboard-manager = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.8"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4", "serde"] }
+tokio = { version = "1", features = ["sync", "time", "fs", "macros", "rt-multi-thread", "io-util", "net"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "rustls", "default-https-client"] }
+atomic-write-file = "0.3"
+rfd = "0.15"
+sha2 = "0.10"
+csv = "1.4"
+
+[dev-dependencies]
+tempfile = "3"
+axum = "0.8"
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

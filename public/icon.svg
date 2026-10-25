@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <title>kvault</title>
+  <desc>A graphite lock on a softly sculpted pearl square, with transparent macOS icon margins.</desc>
+  <defs>
+    <linearGradient id="tile" x1="300" y1="100" x2="744" y2="924" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff"/>
+      <stop offset=".52" stop-color="#f8f9fb"/>
+      <stop offset="1" stop-color="#e4e8ee"/>
+    </linearGradient>
+    <linearGradient id="tile-edge" x1="512" y1="100" x2="512" y2="924" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff"/>
+      <stop offset=".5" stop-color="#e9edf2"/>
+      <stop offset="1" stop-color="#bdc5cf"/>
+    </linearGradient>
+    <linearGradient id="steel" x1="352" y1="280" x2="656" y2="718" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8d97a7"/>
+      <stop offset=".23" stop-color="#596476"/>
+      <stop offset=".56" stop-color="#323d4e"/>
+      <stop offset="1" stop-color="#141d2c"/>
+    </linearGradient>
+    <linearGradient id="shackle-glint" x1="512" y1="280" x2="512" y2="490" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff" stop-opacity=".75"/>
+      <stop offset=".65" stop-color="#ffffff" stop-opacity=".08"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="face" x1="512" y1="474" x2="512" y2="748" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#596476"/>
+      <stop offset=".45" stop-color="#354153"/>
+      <stop offset="1" stop-color="#202a3a"/>
+    </linearGradient>
+    <linearGradient id="keyhole" x1="512" y1="552" x2="512" y2="656" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#dbe2ec"/>
+    </linearGradient>
+    <filter id="tile-shadow" x="32" y="44" width="960" height="960" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="14" stdDeviation="16" flood-color="#000000" flood-opacity=".15"/>
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#000000" flood-opacity=".1"/>
+    </filter>
+    <filter id="lock-shadow" x="240" y="190" width="544" height="660" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="14" stdDeviation="12" flood-color="#152035" flood-opacity=".23"/>
+    </filter>
+  </defs>
+  <g filter="url(#tile-shadow)">
+    <rect x="100" y="100" width="824" height="824" rx="184" fill="url(#tile)" stroke="url(#tile-edge)" stroke-width="3"/>
+    <rect x="106" y="106" width="812" height="812" rx="178" stroke="#ffffff" stroke-opacity=".8" stroke-width="2"/>
+  </g>
+  <g filter="url(#lock-shadow)">
+    <path d="M384 490V394C384 323.3 441.3 266 512 266C582.7 266 640 323.3 640 394V490" stroke="url(#steel)" stroke-width="56" stroke-linecap="round"/>
+    <path d="M384 458V394C384 323.3 441.3 266 512 266C582.7 266 640 323.3 640 394V458" stroke="url(#shackle-glint)" stroke-width="10" stroke-linecap="round"/>
+    <rect x="300" y="456" width="424" height="308" rx="64" fill="url(#steel)"/>
+    <rect x="310" y="466" width="404" height="288" rx="56" fill="url(#face)"/>
+    <path d="M364 466H660C690 466 714 490 714 520" stroke="#ffffff" stroke-opacity=".3" stroke-width="3" stroke-linecap="round"/>
+    <path d="M512 552C495.4 552 482 565.4 482 582C482 594 489 604.4 499 609.2V642C499 649.2 504.8 655 512 655C519.2 655 525 649.2 525 642V609.2C535 604.4 542 594 542 582C542 565.4 528.6 552 512 552Z" fill="url(#keyhole)"/>
+  </g>
+</svg>
