@@ -236,12 +236,16 @@ export function SettingsDialog({
                   ).map(({ value, label, Icon }) => (
                     <Button
                       key={value}
-                      variant="outline"
-                      className={`h-20 flex-col gap-2 text-xs ${theme === value ? "border-foreground bg-muted/40" : ""}`}
+                      variant={theme === value ? "default" : "outline"}
+                      aria-pressed={theme === value}
+                      className="relative h-20 flex-col gap-2 text-xs"
                       onClick={() => setTheme(value)}
                     >
                       <Icon className="size-5" strokeWidth={1.5} />
                       {label}
+                      {theme === value && (
+                        <Check className="absolute right-2 top-2 size-3.5" aria-hidden="true" />
+                      )}
                     </Button>
                   ))}
                 </div>
