@@ -20,12 +20,31 @@ import { emptyS3, errorMessage, type Snapshot } from "@/lib/types";
 
 export function Onboarding() {
   const exists = useVault((s) => s.exists);
+  const autoLock = useVault((s) => s.autoLockHint);
+  const systemUnlock = useVault((s) => s.systemUnlock);
   const [mode, setMode] = useState<"create" | "remote" | "import">("create");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [config, setConfig] = useState(emptyS3);
+  async function unlockWithSystem() {
+    setError("");
+    setPassword("");
+    setConfirm("");
+    setBusy(true);
+    const lifecycle = useVault.getState().lifecycle;
+    try {
+      const snapshot = await invoke<Snapshot>("unlock_with_system");
+      if (useVault.getState().lifecycle === lifecycle)
+        useVault.getState().accept(snapshot, true);
+    } catch (e) {
+      if (useVault.getState().lifecycle === lifecycle)
+        setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  }
   async function submit(event: React.FormEvent) {
     event.preventDefault();
     setError("");
@@ -214,6 +233,24 @@ export function Onboarding() {
               {!busy && <ArrowRight className="ml-auto" />}
             </Button>
           </form>
+          {exists && systemUnlock?.enabled && (
+            <div className="mt-3 space-y-2">
+              <Button
+                variant="outline"
+                className="h-10 w-full"
+                disabled={busy || !systemUnlock.available}
+                onClick={() => void unlockWithSystem()}
+              >
+                <Fingerprint />
+                使用{systemUnlock.label}解锁
+              </Button>
+              <p className="text-[11px] leading-5 text-muted-foreground">
+                {systemUnlock.available
+                  ? "也可以随时使用上方主密码解锁。"
+                  : systemUnlock.reason}
+              </p>
+            </div>
+          )}
           {!exists && mode === "create" && (
             <>
               <p className="mt-4 text-[11px] leading-5 text-muted-foreground">
@@ -256,7 +293,11 @@ export function Onboarding() {
           {exists && (
             <p className="mt-5 flex items-center justify-center gap-1.5 text-[11px] text-muted-foreground">
               <LockKeyhole className="size-3" />
-              离开 5 分钟后自动锁定
+              {autoLock
+                ? autoLock.enabled
+                  ? `闲置 ${autoLock.timeoutMinutes} 分钟后自动锁定`
+                  : "自动锁定已关闭"
+                : "解锁后可设置自动锁定"}
             </p>
           )}
         </section>

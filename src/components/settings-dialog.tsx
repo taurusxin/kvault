@@ -7,6 +7,7 @@ import {
   Cloud,
   Download,
   HardDrive,
+  Fingerprint,
   KeyRound,
   LoaderCircle,
   LockKeyhole,
@@ -52,7 +53,7 @@ export function SettingsDialog({
   const [working, setWorking] = useState(false);
   const [tested, setTested] = useState(false);
   const [security, setSecurity] = useState<
-    "change" | "migrate" | "import" | null
+    "change" | "migrate" | "import" | "system" | null
   >(null);
   const [oldPassword, setOldPassword] = useState("");
   const [password, setPassword] = useState("");
@@ -127,30 +128,38 @@ export function SettingsDialog({
     const lifecycle = useVault.getState().lifecycle;
     await run(async () => {
       const next =
-        security === "change"
-          ? await invoke<Snapshot>("change_password", {
+        security === "system"
+          ? await invoke<Snapshot>("set_system_unlock", {
               sessionId: snapshot!.sessionId,
-              oldPassword: old,
-              newPassword: submitted,
+              enabled: true,
+              password: submitted,
             })
-          : security === "migrate"
-            ? await invoke<Snapshot>("migrate_password", {
+          : security === "change"
+            ? await invoke<Snapshot>("change_password", {
                 sessionId: snapshot!.sessionId,
-                password: submitted,
+                oldPassword: old,
+                newPassword: submitted,
               })
-            : await invoke<Snapshot | null>("import_backup", {
-                password: submitted,
-                replace: true,
-                sessionId: snapshot!.sessionId,
-              });
+            : security === "migrate"
+              ? await invoke<Snapshot>("migrate_password", {
+                  sessionId: snapshot!.sessionId,
+                  password: submitted,
+                })
+              : await invoke<Snapshot | null>("import_backup", {
+                  password: submitted,
+                  replace: true,
+                  sessionId: snapshot!.sessionId,
+                });
       if (next && useVault.getState().lifecycle === lifecycle) {
-        useVault.getState().accept(next, true);
+        useVault.getState().accept(next, security !== "system");
         setSecurity(null);
-        onOpenChange(false);
+        if (security !== "system") onOpenChange(false);
         toast.success(
           security === "import"
             ? "加密备份已导入，同步配置已清除"
-            : "主密码已更新",
+            : security === "system"
+              ? "已启用本机系统解锁，主密码仍可使用"
+              : "主密码已更新",
         );
       }
     });
@@ -397,6 +406,15 @@ export function SettingsDialog({
                   setError("");
                 }}
               />
+              {snapshot.credentialError && (
+                <p
+                  role="alert"
+                  className="rounded-lg bg-destructive/10 p-3 text-xs leading-5 text-destructive"
+                >
+                  {snapshot.credentialError}
+                  。本地记录可继续编辑；请恢复凭据服务、重新填写配置或停用同步。
+                </p>
+              )}
               {error && !security && (
                 <p role="alert" className="text-xs leading-5 text-destructive">
                   {error}
@@ -442,7 +460,7 @@ export function SettingsDialog({
                   保存并启用
                 </Button>
               </div>
-              {snapshot.config && (
+              {(snapshot.config || snapshot.credentialError) && (
                 <div className="flex items-center justify-between border-t pt-4">
                   <p className="text-[11px] text-muted-foreground">
                     停用后保留本地数据与云端文件。
@@ -474,7 +492,55 @@ export function SettingsDialog({
               <div>
                 <h2 className="text-sm font-medium">安全与备份</h2>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  管理主密码、密码迁移和加密备份。
+                  管理可选的系统解锁、主密码和加密备份。
+                </p>
+              </div>
+              <div className="space-y-3 rounded-xl border p-4">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <Label
+                      htmlFor="system-unlock-enabled"
+                      className="gap-2 text-xs font-medium"
+                    >
+                      <Fingerprint className="size-4" />
+                      系统解锁
+                    </Label>
+                    <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
+                      {snapshot.systemUnlock.label}
+                      ，仅在本机生效。默认关闭，主密码始终可用。
+                    </p>
+                  </div>
+                  <Switch
+                    id="system-unlock-enabled"
+                    checked={snapshot.systemUnlock.enabled}
+                    disabled={
+                      working ||
+                      snapshot.recoveryPending ||
+                      (!snapshot.systemUnlock.enabled &&
+                        !snapshot.systemUnlock.available)
+                    }
+                    onCheckedChange={(enabled) => {
+                      if (enabled) setSecurity("system");
+                      else
+                        void run(async () => {
+                          const lifecycle = useVault.getState().lifecycle;
+                          const next = await invoke<Snapshot>(
+                            "set_system_unlock",
+                            {
+                              sessionId: snapshot.sessionId,
+                              enabled: false,
+                              password: "",
+                            },
+                          );
+                          if (useVault.getState().lifecycle === lifecycle)
+                            useVault.getState().accept(next);
+                        }, "已关闭系统解锁");
+                    }}
+                  />
+                </div>
+                <p className="text-[11px] leading-5 text-muted-foreground">
+                  {snapshot.systemUnlock.reason ??
+                    "启用时需确认主密码并完成系统验证。更换主密码后需重新启用。"}
                 </p>
               </div>
               {snapshot.recoveryPending && (
@@ -597,20 +663,24 @@ export function SettingsDialog({
         <DialogContent>
           <DialogHeader>
             <DialogTitle>
-              {security === "change"
-                ? "修改主密码"
-                : security === "migrate"
-                  ? "迁移到新主密码"
-                  : "导入并替换保险库"}
+              {security === "system"
+                ? "启用系统解锁"
+                : security === "change"
+                  ? "修改主密码"
+                  : security === "migrate"
+                    ? "迁移到新主密码"
+                    : "导入并替换保险库"}
             </DialogTitle>
             <DialogDescription>
-              {security === "change"
-                ? snapshot.config
-                  ? "需要联网并先完成同步，所有记录将使用新密钥重新加密。"
-                  : "所有本地记录将使用新密钥重新加密。"
-                : security === "migrate"
-                  ? "本地离线修改会与云端合并，出现冲突时保留双方。"
-                  : "此操作将替换本地全部记录并清除同步配置，请先导出当前保险库。"}
+              {security === "system"
+                ? "先确认当前主密码，再完成系统验证。你仍可随时使用主密码解锁，也可以在设置中关闭此功能。"
+                : security === "change"
+                  ? snapshot.config
+                    ? "需要联网并先完成同步，所有记录将使用新密钥重新加密。"
+                    : "所有本地记录将使用新密钥重新加密。"
+                  : security === "migrate"
+                    ? "本地离线修改会与云端合并，出现冲突时保留双方。"
+                    : "此操作将替换本地全部记录并清除同步配置，请先导出当前保险库。"}
             </DialogDescription>
           </DialogHeader>
           <form
@@ -633,7 +703,11 @@ export function SettingsDialog({
             )}
             <div className="space-y-2">
               <Label htmlFor="new-password">
-                {security === "import" ? "备份的主密码" : "新主密码"}
+                {security === "system"
+                  ? "当前主密码"
+                  : security === "import"
+                    ? "备份的主密码"
+                    : "新主密码"}
               </Label>
               <Input
                 id="new-password"
@@ -695,7 +769,11 @@ export function SettingsDialog({
                 }
               >
                 {working && <LoaderCircle className="animate-spin" />}
-                {security === "import" ? "选择文件并替换" : "确认"}
+                {security === "system"
+                  ? "启用并验证"
+                  : security === "import"
+                    ? "选择文件并替换"
+                    : "确认"}
               </Button>
             </DialogFooter>
           </form>

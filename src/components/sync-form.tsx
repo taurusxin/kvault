@@ -124,7 +124,8 @@ export function SyncForm({
         </p>
       )}
       <p className="text-[11px] leading-relaxed text-muted-foreground">
-        只上传加密后的保险库。连接凭据加密保存在本机，服务需支持 ETag 条件写入。
+        只上传加密后的保险库。连接凭据保存在本机系统凭据库，服务需支持 ETag
+        条件写入。
       </p>
     </div>
   );

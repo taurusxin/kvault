@@ -85,6 +85,10 @@ impl Server {
             deleted: false,
         });
         let mut vault = state.vault.lock().unwrap();
+        local.sync_profile = vault
+            .storage
+            .save_sync(&keys.header.vault_id, local.config.as_ref())
+            .unwrap();
         vault.storage.save(&local, &keys).unwrap();
         let snapshot = vault.install(keys, local).unwrap();
         drop(vault);

@@ -12,6 +12,7 @@ dist
 dist-ssr
 /.qa-vault/
 /.artifacts/
+/.private-exports/
 *.tsbuildinfo
 *.local
 

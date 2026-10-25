@@ -1,5 +1,9 @@
 mod commands;
 mod error;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg_attr(test, allow(dead_code))]
+mod security;
 mod sync;
 mod vault;
 
@@ -17,7 +21,15 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_clipboard_manager::init())
+        .on_window_event(|_window, _event| {
+            #[cfg(target_os = "macos")]
+            macos::on_window_event(_window, _event);
+        })
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            if let Some(window) = app.get_webview_window("main") {
+                macos::initialize(&window)?;
+            }
             let data_dir = app.path().app_data_dir()?;
             #[cfg(debug_assertions)]
             let data_dir = std::env::var_os("KVAULT_DATA_DIR")
@@ -31,6 +43,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
+            commands::get_preferences,
+            commands::set_theme,
+            commands::set_system_unlock,
+            commands::unlock_with_system,
             commands::create_vault,
             commands::unlock_vault,
             commands::lock_vault,

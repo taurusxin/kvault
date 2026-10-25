@@ -4,6 +4,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
@@ -44,6 +45,13 @@ const fixture = (): Snapshot => ({
   conflicts: [],
   recoveryPending: false,
   autoLock: { enabled: true, timeoutMinutes: 5 },
+  systemUnlock: {
+    available: true,
+    enabled: false,
+    label: "Touch ID / 系统验证",
+    reason: null,
+  },
+  credentialError: null,
   tables: [
     { id: "table", name: "工作", deleted: false, createdAt: 1, updatedAt: 1 },
   ],
@@ -59,6 +67,19 @@ const fixture = (): Snapshot => ({
       deleted: false,
     },
   ],
+});
+
+const bootFixture = () => ({
+  exists: true,
+  recoveryPending: false,
+  platform: "macos",
+  preferences: {
+    version: 1,
+    autoLock: { enabled: true, timeoutMinutes: 5 },
+    theme: "system",
+    systemUnlock: null,
+  },
+  systemUnlock: fixture().systemUnlock,
 });
 
 const selectionFixture = (): Snapshot => {
@@ -83,15 +104,233 @@ beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
   useVault.getState().clear();
-  useVault.setState({ initialized: true, exists: true, platform: "macos" });
+  useVault.setState({
+    initialized: true,
+    exists: true,
+    platform: "macos",
+    autoLockHint: null,
+    systemUnlock: null,
+  });
   vi.mocked(invoke).mockImplementation(async (command) =>
     command === "bootstrap"
-      ? { exists: true, recoveryPending: false, platform: "macos" }
+      ? {
+          exists: true,
+          recoveryPending: false,
+          platform: "macos",
+          preferences: {
+            autoLock: { enabled: true, timeoutMinutes: 5 },
+            theme: "system",
+          },
+          systemUnlock: fixture().systemUnlock,
+        }
       : undefined,
   );
 });
 
 describe("保险库界面与会话", () => {
+  it("系统解锁默认关闭，主密码入口始终存在且不会自动触发系统验证", async () => {
+    render(<App />);
+    expect(await screen.findByLabelText("主密码")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /使用.*系统验证.*解锁/ }),
+    ).not.toBeInTheDocument();
+    expect(invoke).not.toHaveBeenCalledWith("unlock_with_system");
+  });
+
+  it("系统验证取消后可直接改用主密码", async () => {
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "bootstrap")
+        return {
+          ...bootFixture(),
+          systemUnlock: { ...fixture().systemUnlock, enabled: true },
+        };
+      if (command === "unlock_with_system")
+        throw {
+          code: "auth_cancelled",
+          message: "已取消系统验证，可使用主密码解锁",
+        };
+      if (command === "unlock_vault") return fixture();
+    });
+    render(<App />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: /使用.*系统验证.*解锁/ }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "已取消系统验证",
+    );
+    const input = screen.getByLabelText("主密码");
+    expect(input).toBeEnabled();
+    fireEvent.change(input, { target: { value: "master-password" } });
+    fireEvent.click(screen.getByRole("button", { name: "解锁保险库" }));
+    await waitFor(() => expect(useVault.getState().snapshot).not.toBeNull());
+    expect(invoke).toHaveBeenCalledWith("unlock_vault", {
+      password: "master-password",
+    });
+  });
+
+  it("锁定后忽略未完成系统验证的返回值", async () => {
+    let finish!: (snapshot: Snapshot) => void;
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "bootstrap")
+        return {
+          ...bootFixture(),
+          systemUnlock: { ...fixture().systemUnlock, enabled: true },
+        };
+      if (command === "unlock_with_system")
+        return new Promise<Snapshot>((resolve) => {
+          finish = resolve;
+        });
+    });
+    render(<App />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: /使用.*系统验证.*解锁/ }),
+    );
+    await act(async () => {
+      useVault.getState().clear();
+      finish(fixture());
+    });
+    expect(useVault.getState().snapshot).toBeNull();
+    expect(screen.getByLabelText("主密码")).toBeInTheDocument();
+  });
+
+  it("系统解锁在安全设置中显式启用并确认主密码，也可以关闭", async () => {
+    const snapshot = fixture();
+    let revision = snapshot.revision;
+    useVault.getState().accept(snapshot, true);
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "bootstrap") return bootFixture();
+      if (command === "set_system_unlock")
+        return {
+          ...snapshot,
+          revision: ++revision,
+          systemUnlock: {
+            ...snapshot.systemUnlock,
+            enabled: (args as { enabled: boolean }).enabled,
+          },
+        };
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "设置" }));
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "安全与备份" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(screen.getByRole("switch", { name: "系统解锁" })).not.toBeChecked();
+    fireEvent.click(screen.getByRole("switch", { name: "系统解锁" }));
+    const dialog = screen.getByRole("dialog", { name: "启用系统解锁" });
+    const password = within(dialog).getByLabelText("当前主密码");
+    fireEvent.change(password, { target: { value: "master-password" } });
+    act(() =>
+      useVault.setState({
+        draft: {
+          id: "entry",
+          tableId: "table",
+          key: "api.production.token",
+          value: "unsaved-draft",
+          notes: "",
+        },
+        selectedEntry: "entry",
+        dirty: true,
+      }),
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "启用并验证" }));
+    expect(password).toHaveValue("");
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: "系统解锁" })).toBeChecked(),
+    );
+    expect(invoke).toHaveBeenCalledWith("set_system_unlock", {
+      sessionId: 1,
+      enabled: true,
+      password: "master-password",
+    });
+    expect(useVault.getState().dirty).toBe(true);
+    expect(useVault.getState().draft?.value).toBe("unsaved-draft");
+    expect(JSON.stringify(useVault.getState())).not.toContain(
+      "master-password",
+    );
+    fireEvent.click(screen.getByRole("switch", { name: "系统解锁" }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("switch", { name: "系统解锁" }),
+      ).not.toBeChecked(),
+    );
+    expect(invoke).toHaveBeenCalledWith("set_system_unlock", {
+      sessionId: 1,
+      enabled: false,
+      password: "",
+    });
+  });
+
+  it("不支持系统验证时禁用开关，仍保留主密码功能", async () => {
+    const snapshot = fixture();
+    snapshot.systemUnlock = {
+      available: false,
+      enabled: false,
+      label: "系统验证",
+      reason: "此构建未配置钥匙串签名授权",
+    };
+    useVault.getState().accept(snapshot, true);
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "设置" }));
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "安全与备份" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(screen.getByRole("switch", { name: "系统解锁" })).toBeDisabled();
+    expect(screen.getByText("此构建未配置钥匙串签名授权")).toBeInTheDocument();
+  });
+
+  it("外观使用 Rust 配置接口保存，不写入 WebView localStorage", async () => {
+    useVault.getState().accept(fixture(), true);
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "深色" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("set_theme", { theme: "dark" }),
+    );
+    expect(document.documentElement).toHaveClass("dark");
+    expect(localStorage.getItem("kvault-theme")).toBeNull();
+  });
+  it("首次启动从本机配置读取自动锁定时长，无需解密", async () => {
+    render(<App />);
+    expect(
+      await screen.findByText("闲置 5 分钟后自动锁定"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("解锁后可设置自动锁定")).not.toBeInTheDocument();
+  });
+  it.each([
+    {
+      settings: { enabled: true, timeoutMinutes: 15 },
+      text: "闲置 15 分钟后自动锁定",
+    },
+    {
+      settings: { enabled: false, timeoutMinutes: 30 },
+      text: "自动锁定已关闭",
+    },
+  ])(
+    "锁定页显示本次会话实际的自动锁定设置：$text",
+    async ({ settings, text }) => {
+      const snapshot = fixture();
+      snapshot.autoLock = settings;
+      useVault.getState().accept(snapshot, true);
+      render(<App />);
+      fireEvent.click(
+        await screen.findByRole("button", { name: "锁定保险库" }),
+      );
+      expect(await screen.findByText(text)).toBeInTheDocument();
+      expect(useVault.getState().snapshot).toBeNull();
+      expect(useVault.getState().draft).toBeNull();
+      act(() =>
+        useVault.getState().accept({
+          ...snapshot,
+          autoLock: { enabled: true, timeoutMinutes: 5 },
+          revision: 2,
+        }),
+      );
+      expect(screen.getByText(text)).toBeInTheDocument();
+      expect(useVault.getState().snapshot).toBeNull();
+    },
+  );
   it.each([false, true])(
     "云同步入口直接选中云同步页，普通设置入口仍打开通用页（已配置：%s）",
     async (configured) => {
@@ -145,8 +384,7 @@ describe("保险库界面与会话", () => {
     let saved = fixture();
     useVault.getState().accept(saved, true);
     vi.mocked(invoke).mockImplementation(async (command, args) => {
-      if (command === "bootstrap")
-        return { exists: true, recoveryPending: false, platform: "macos" };
+      if (command === "bootstrap") return bootFixture();
       if (command === "mutate_vault") {
         const action = (
           args as { action: { type: string; settings: Snapshot["autoLock"] } }
@@ -205,8 +443,7 @@ describe("保险库界面与会话", () => {
   it("自动锁定拒绝无效时长，保存失败时保留原设置和待重试输入", async () => {
     useVault.getState().accept(fixture(), true);
     vi.mocked(invoke).mockImplementation(async (command) => {
-      if (command === "bootstrap")
-        return { exists: true, recoveryPending: false, platform: "macos" };
+      if (command === "bootstrap") return bootFixture();
       if (command === "mutate_vault")
         throw { code: "storage", message: "无法写入保险库" };
     });
@@ -337,7 +574,7 @@ describe("保险库界面与会话", () => {
             ),
           }
         : command === "bootstrap"
-          ? { exists: true, recoveryPending: false, platform: "macos" }
+          ? bootFixture()
           : undefined,
     );
     render(<App />);
@@ -398,7 +635,7 @@ describe("保险库界面与会话", () => {
             ),
           }
         : command === "bootstrap"
-          ? { exists: true, recoveryPending: false, platform: "macos" }
+          ? bootFixture()
           : undefined,
     );
     render(<App />);
@@ -460,8 +697,7 @@ describe("保险库界面与会话", () => {
     const snapshot = selectionFixture();
     useVault.getState().accept(snapshot, true);
     vi.mocked(invoke).mockImplementation(async (command, args) => {
-      if (command === "bootstrap")
-        return { exists: true, recoveryPending: false, platform: "macos" };
+      if (command === "bootstrap") return bootFixture();
       if (command === "mutate_vault") {
         const { action } = args as { action: { ids: string[] } };
         return {
@@ -603,7 +839,7 @@ describe("保险库界面与会话", () => {
     ];
     vi.mocked(invoke).mockImplementation(async (command) =>
       command === "bootstrap"
-        ? { exists: true, platform: "macos", recoveryPending: false }
+        ? bootFixture()
         : command === "preview_import"
           ? {
               rows,
@@ -648,7 +884,7 @@ describe("保险库界面与会话", () => {
     let finish!: (result: unknown) => void;
     vi.mocked(invoke).mockImplementation(async (command) =>
       command === "bootstrap"
-        ? { exists: true, platform: "macos", recoveryPending: false }
+        ? bootFixture()
         : command === "select_import_csv"
           ? { name: "records.csv", text: "key,value\nfile-key,file-secret" }
           : command === "preview_import"
@@ -708,7 +944,7 @@ describe("保险库界面与会话", () => {
     useVault.getState().accept(snapshot, true);
     vi.mocked(invoke).mockImplementation(async (command) =>
       command === "bootstrap"
-        ? { exists: true, recoveryPending: false, platform: "macos" }
+        ? bootFixture()
         : command === "mutate_vault"
           ? { ...snapshot, revision: 2, conflicts: [] }
           : undefined,

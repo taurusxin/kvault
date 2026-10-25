@@ -1,12 +1,11 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Minus, Square, Copy, X, LockKeyhole, PanelLeft } from "lucide-react";
+import { Minus, Square, Copy, X, LockKeyhole } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { desktop, useVault } from "@/stores/vault";
 
 export function WindowBar() {
   const platform = useVault((s) => s.platform);
-  const unlocked = useVault((s) => Boolean(s.snapshot));
   const [maximized, setMaximized] = useState(false);
   const mac =
     platform === "macos" || (!platform && /Mac/.test(navigator.userAgent));
@@ -35,37 +34,22 @@ export function WindowBar() {
   }, []);
   return (
     <header
-      className={`flex shrink-0 select-none items-center border-b bg-sidebar/70 ${mac ? "h-8" : "h-12"}`}
+      className={`relative flex shrink-0 select-none items-center justify-between border-b bg-sidebar/70 ${mac ? "h-8" : "h-12"}`}
       data-tauri-drag-region
     >
-      <div
-        className={`flex h-full w-56 shrink-0 items-center gap-2.5 px-5 ${mac ? "pl-[88px]" : ""}`}
+      <span
+        className={`pointer-events-none absolute inset-0 flex items-center justify-center tracking-tight ${mac ? "text-[13px] font-medium" : "text-sm font-semibold"}`}
         data-tauri-drag-region
       >
-        {!mac && (
+        KVault
+      </span>
+      {!mac && (
+        <div className="flex h-full items-center px-5" data-tauri-drag-region>
           <div className="flex size-6 items-center justify-center rounded-lg bg-foreground text-background">
             <LockKeyhole className="size-3.5" />
           </div>
-        )}
-        <span
-          className={`tracking-tight ${mac ? "text-[13px] font-medium" : "text-sm font-semibold"}`}
-          data-tauri-drag-region
-        >
-          KVault
-        </span>
-        {unlocked && !mac && (
-          <PanelLeft className="ml-auto size-3.5 text-muted-foreground/60" />
-        )}
-      </div>
-      <div
-        className="flex flex-1 items-center justify-center gap-1.5 pr-12 text-[11px] text-muted-foreground"
-        data-tauri-drag-region
-      >
-        <LockKeyhole className="size-3" />
-        <span data-tauri-drag-region>
-          {unlocked ? "端到端加密 · 私人保险库" : "你的记录，只属于你"}
-        </span>
-      </div>
+        </div>
+      )}
       {!mac && desktop && (
         <div className="flex h-full items-center">
           <Button

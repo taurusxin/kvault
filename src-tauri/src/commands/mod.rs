@@ -25,12 +25,193 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
 }
 
 #[tauri::command]
+pub fn get_preferences(state: State<'_, Shared>) -> Result<crate::vault::preferences::Preferences> {
+    state
+        .vault
+        .lock()
+        .map_err(AppError::storage)?
+        .storage
+        .preferences()
+}
+
+#[tauri::command]
+pub fn set_theme(state: State<'_, Shared>, theme: crate::vault::preferences::Theme) -> Result<()> {
+    state
+        .vault
+        .lock()
+        .map_err(AppError::storage)?
+        .storage
+        .update_preferences(|p| p.theme = theme)?;
+    Ok(())
+}
+
+fn window_handle(_window: &tauri::WebviewWindow) -> Result<isize> {
+    #[cfg(target_os = "windows")]
+    return _window
+        .hwnd()
+        .map(|h| h.0 as isize)
+        .map_err(|_| crate::security::unavailable());
+    #[cfg(not(target_os = "windows"))]
+    Ok(0)
+}
+
+#[tauri::command]
+pub async fn set_system_unlock(
+    state: State<'_, Shared>,
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    session_id: u64,
+    enabled: bool,
+    password: String,
+) -> Result<Snapshot> {
+    let handle = window_handle(&window)?;
+    configure_system_unlock(state.inner(), &app, session_id, enabled, password, handle).await
+}
+
+pub(crate) async fn configure_system_unlock(
+    shared: &Shared,
+    app: &impl service::Events,
+    session_id: u64,
+    enabled: bool,
+    password: String,
+    handle: isize,
+) -> Result<Snapshot> {
+    let _auth = shared.auth_gate.lock().await;
+    let password = Zeroizing::new(password);
+    let (keys, storage) = {
+        let vault = shared.vault.lock().map_err(AppError::storage)?;
+        let session = vault.check(session_id)?;
+        if enabled && session.state.rotation.is_some() {
+            return Err(AppError::invalid("请先完成密码变更恢复"));
+        }
+        (session.keys.clone(), vault.storage.clone())
+    };
+    let task_shared = shared.clone();
+    let snapshot = blocking(move || {
+        if enabled {
+            if !storage.secrets.availability().available {
+                return Err(crate::security::unavailable());
+            }
+            let verified = Keys::derive(&password, keys.header.clone())?;
+            let check = crypto::seal(&true, &keys, "password-check")?;
+            crypto::open::<bool>(&check, &verified, "password-check")?;
+            let fingerprint = crypto::fingerprint(&keys.header)?;
+            let account = storage.unlock_account(&fingerprint);
+            // No vault mutex is held while the native authentication UI is open.
+            storage
+                .secrets
+                .protect(&account, keys.key.as_ref(), handle)?;
+            let commit = (|| {
+                let vault = task_shared.vault.lock().map_err(AppError::storage)?;
+                if vault.check(session_id)?.keys.header != keys.header {
+                    return Err(AppError::locked());
+                }
+                storage.update_preferences(|p| p.system_unlock = Some(fingerprint))?;
+                Ok(())
+            })();
+            if let Err(error) = commit {
+                storage.secrets.revoke(&account)?;
+                return Err(error);
+            }
+        } else {
+            storage.disable_system_unlock()?;
+        }
+        let mut vault = task_shared.vault.lock().map_err(AppError::storage)?;
+        vault.check(session_id)?;
+        vault
+            .session
+            .as_mut()
+            .ok_or_else(AppError::locked)?
+            .state
+            .revision += 1;
+        vault.touch();
+        vault.snapshot()
+    })
+    .await?;
+    changed(app, &snapshot);
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub async fn unlock_with_system(
+    state: State<'_, Shared>,
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<Snapshot> {
+    system_unlock_impl(state.inner(), &app, window_handle(&window)?).await
+}
+
+pub(crate) async fn system_unlock_impl(
+    shared: &Shared,
+    app: &impl service::Events,
+    handle: isize,
+) -> Result<Snapshot> {
+    let _auth = shared.auth_gate.lock().await;
+    let (storage, generation, bytes, header) = {
+        let vault = shared.vault.lock().map_err(AppError::storage)?;
+        if vault.session.is_some() {
+            return Err(AppError::invalid("保险库已解锁"));
+        }
+        if vault.storage.pending().exists() {
+            return Err(AppError::invalid("密码恢复期间请使用主密码解锁"));
+        }
+        let bytes = vault.storage.read(&vault.storage.path())?;
+        let header = crypto::header(&bytes, "local")?;
+        if !vault.storage.system_unlock(Some(&header))?.enabled {
+            return Err(crate::security::unavailable());
+        }
+        (vault.storage.clone(), vault.generation, bytes, header)
+    };
+    let (keys, mut local) = blocking(move || {
+        let secret = storage.secrets.unprotect(
+            &storage.unlock_account(&crypto::fingerprint(&header)?),
+            handle,
+        )?;
+        let keys = Keys::from_device(header, &secret)?;
+        let mut local: LocalState = crypto::open(&bytes, &keys, "local")?;
+        if local.rotation.is_some() {
+            return Err(AppError::invalid("密码恢复期间请使用主密码解锁"));
+        }
+        storage.restore_device_state(&mut local, &keys.header.vault_id)?;
+        Ok((keys, local))
+    })
+    .await?;
+    // Never accept a response from a prompt opened before a lock or file change.
+    {
+        let vault = shared.vault.lock().map_err(AppError::storage)?;
+        if vault.generation != generation
+            || crypto::header(&vault.storage.read(&vault.storage.path())?, "local")? != keys.header
+        {
+            return Err(AppError::locked());
+        }
+    }
+    local.auto_lock = shared
+        .vault
+        .lock()
+        .map_err(AppError::storage)?
+        .storage
+        .preferences()?
+        .auto_lock;
+    finish_unlock(shared, app, keys, local, false, generation).await
+}
+
+#[tauri::command]
 pub fn bootstrap(state: State<'_, Shared>) -> Result<Bootstrap> {
     let vault = state.vault.lock().map_err(AppError::storage)?;
+    let header = if vault.storage.exists() {
+        Some(crypto::header(
+            &vault.storage.read(&vault.storage.path())?,
+            "local",
+        )?)
+    } else {
+        None
+    };
     Ok(Bootstrap {
         exists: vault.storage.exists(),
         recovery_pending: vault.storage.pending().exists(),
         platform: std::env::consts::OS.into(),
+        preferences: vault.storage.preferences()?,
+        system_unlock: vault.storage.system_unlock(header.as_ref())?,
     })
 }
 
@@ -83,6 +264,7 @@ pub(crate) async fn unlock_impl(
     app: &impl service::Events,
     password: String,
 ) -> Result<Snapshot> {
+    let _auth = shared.auth_gate.lock().await;
     let password = Zeroizing::new(password);
     let (keys, mut local, from_pending, generation) = blocking({
         let shared = shared.clone();
@@ -99,7 +281,11 @@ pub(crate) async fn unlock_impl(
                     continue;
                 }
                 let bytes = vault.storage.read(&path)?;
-                let keys = Keys::derive(&password, crypto::header(&bytes, "local")?)?;
+                let keys = match Keys::derive(&password, crypto::header(&bytes, "local")?) {
+                    Ok(keys) => keys,
+                    Err(e) if e.code == "decrypt" => continue,
+                    Err(e) => return Err(e),
+                };
                 if let Ok(local) = crypto::open::<LocalState>(&bytes, &keys, "local") {
                     return Ok((keys, local, pending, vault.generation));
                 }
@@ -108,6 +294,23 @@ pub(crate) async fn unlock_impl(
         }
     })
     .await?;
+    shared
+        .vault
+        .lock()
+        .map_err(AppError::storage)?
+        .storage
+        .restore_device_state(&mut local, &keys.header.vault_id)?;
+    finish_unlock(shared, app, keys, local, from_pending, generation).await
+}
+
+async fn finish_unlock(
+    shared: &Shared,
+    app: &impl service::Events,
+    keys: Keys,
+    mut local: LocalState,
+    from_pending: bool,
+    generation: u64,
+) -> Result<Snapshot> {
     if local.conflicts.is_empty() {
         validate_document(&local.document)?;
     }
@@ -178,14 +381,18 @@ pub(crate) async fn unlock_impl(
     changed(app, &snapshot);
     status(
         app,
-        if snapshot.recovery_pending {
+        if snapshot.credential_error.is_some() {
+            "error"
+        } else if snapshot.recovery_pending {
             "recovery"
         } else if snapshot.config.is_some() {
             "pending"
         } else {
             "local"
         },
-        if snapshot.recovery_pending {
+        if let Some(error) = &snapshot.credential_error {
+            error.as_str()
+        } else if snapshot.recovery_pending {
             "密码变更待核验，请输入新密码恢复或联网重试"
         } else {
             "保险库已解锁"
@@ -337,7 +544,7 @@ pub async fn connect_remote(
         let keys = Keys::derive(&password, crypto::header(&file.bytes, "snapshot")?)?;
         let doc: Document = crypto::open(&file.bytes, &keys, "snapshot")?;
         validate_document(&doc)?;
-        let local = LocalState {
+        let mut local = LocalState {
             document: doc.clone(),
             baseline: doc,
             config: Some(config),
@@ -353,6 +560,9 @@ pub async fn connect_remote(
         if vault.storage.exists() {
             return Err(AppError::invalid("已有本地保险库，已取消连接"));
         }
+        local.sync_profile = vault
+            .storage
+            .save_sync(&keys.header.vault_id, local.config.as_ref())?;
         vault.storage.save(&local, &keys)?;
         vault.install(keys, local)
     })
@@ -785,9 +995,21 @@ pub async fn import_backup(
             document,
             ..Default::default()
         };
+        let old_profile = vault
+            .session
+            .as_ref()
+            .and_then(|s| s.state.sync_profile.clone());
+        let old_id = vault
+            .session
+            .as_ref()
+            .map(|s| s.keys.header.vault_id.clone());
         vault.storage.save(&next, &keys)?;
         vault.storage.discard_pending();
-        vault.install(keys, next)
+        let snapshot = vault.install(keys, next)?;
+        if let Some(old_id) = old_id {
+            let _ = vault.storage.delete_sync(&old_id, old_profile.as_deref());
+        }
+        Ok(snapshot)
     })
     .await?;
     changed(&app, &snapshot);

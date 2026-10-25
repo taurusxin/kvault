@@ -17,8 +17,13 @@ fn clone_device(state: &crate::vault::Shared) -> (crate::vault::Shared, tempfile
     let vault = state.vault.lock().unwrap();
     let s = vault.session.as_ref().unwrap();
     let mut target = cloned.vault.lock().unwrap();
-    target.storage.save(&s.state, &s.keys).unwrap();
-    let snapshot = target.install(s.keys.clone(), s.state.clone()).unwrap();
+    let mut local = s.state.clone();
+    local.sync_profile = target
+        .storage
+        .save_sync(&s.keys.header.vault_id, s.state.config.as_ref())
+        .unwrap();
+    target.storage.save(&local, &s.keys).unwrap();
+    let snapshot = target.install(s.keys.clone(), local).unwrap();
     drop(target);
     (cloned, dir, snapshot.session_id)
 }
@@ -263,7 +268,11 @@ async fn ambiguous_rotation_recovers_after_restart_with_new_password() {
     assert!(state.snapshot(sid).unwrap().recovery_pending);
     state.lock().unwrap();
     let restarted = std::sync::Arc::new(crate::vault::AppState::new(
-        crate::vault::storage::Storage::new(dir.path().into()).unwrap(),
+        crate::vault::storage::Storage::with_secrets(
+            dir.path().into(),
+            state.vault.lock().unwrap().storage.secrets.clone(),
+        )
+        .unwrap(),
     ));
     let snapshot = unlock_impl(&restarted, &(), "new-password".into())
         .await

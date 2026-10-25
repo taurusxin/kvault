@@ -19,13 +19,15 @@ pnpm tauri build --debug --bundles app
 pnpm icons
 ```
 
-Windows 使用 WebView2；Linux 需要 WebKitGTK 4.1、GTK 3 和相应构建依赖。安装包必须在对应平台构建和验收，正式分发时另行配置签名、公证。仅运行 `pnpm dev` 可以预览界面，浏览器不会提供保险库、文件或云存储能力。
+Windows 使用 WebView2；Linux 需要 WebKitGTK 4.1、GTK 3、D-Bus 开发包（Debian/Ubuntu 为 `libdbus-1-dev`）及运行中的 Secret Service。macOS 最低为 11，需要 Xcode Command Line Tools 的 Swift 编译器；`build.rs` 仅在 macOS 编译 CryptoKit/LocalAuthentication 桥接，Swift 运行时由系统提供。安装包必须在对应平台构建和验收，正式分发时另行配置签名、公证。仅运行 `pnpm dev` 可以预览界面，浏览器不会提供保险库、文件或云存储能力。
 
-前端为 React / TypeScript / Tailwind CSS 4，使用 shadcn/ui `radix-nova`、Lucide、Zustand。Rust 按 `vault`、`sync`、`commands` 组织；前端通过 Tauri IPC 调用后端，不直接读写文件或连接云存储。
+前端为 React / TypeScript / Tailwind CSS 4，使用 shadcn/ui `radix-nova`、Lucide、Zustand。Rust 按 `vault`、`sync`、`security`、`commands` 组织；前端通过 Tauri IPC 调用后端，不直接读写文件或连接云存储。
 
 应用展示名称为 **KVault**。包名 `kvault`、Rust 库名 `kvault_lib`、应用标识符 `com.taurusxin.kvault` 及现有数据路径保持小写命名。
 
-macOS 使用 32px 紧凑标题栏和原生红绿灯；Windows、Linux 保留自绘窗口按钮。图标源稿为 `public/icon.svg`，采用 1024px 透明画布与 824px 圆角底板，保留 Dock 所需的外部留白。`pnpm icons` 同步更新 PNG、Windows ICO 和 macOS ICNS；移动端资源只在临时目录生成后清理。
+macOS 使用 32px 紧凑标题栏，由 Rust 根据原生按钮实际尺寸动态居中红绿灯；窗口缩放及退出全屏后会恢复定位。Windows、Linux 保留自绘窗口按钮。各平台均以整个窗口宽度居中显示 KVault 标题。图标源稿为 `public/icon.svg`，采用 1024px 透明画布与 824px 圆角底板，保留 Dock 所需的外部留白。`pnpm icons` 同步更新 PNG、Windows ICO 和 macOS ICNS；移动端资源只在临时目录生成后清理。
+
+原生标题栏的 SDK 差异与验证结果见 [macOS 标题栏调查](macos-titlebar-investigation.md)。调试构建可设置 `KVAULT_TITLEBAR_DIAGNOSTICS=1` 输出按钮几何；与 `KVAULT_DATA_DIR` 指定的独立测试目录配合使用，不应连接真实保险库。
 
 ## 目录结构
 
@@ -44,6 +46,7 @@ kvault/
 │   └── src/
 │       ├── commands/        # Tauri IPC 命令
 │       ├── sync/            # 远端存储、合并与同步队列
+│       ├── security/        # 系统凭据库、Secure Enclave / Windows Hello
 │       └── vault/           # 数据模型、加密、持久化与批量导入
 └── docs/                    # 使用、开发与实现文档
 ```
@@ -101,3 +104,11 @@ KVAULT_DATA_DIR="$PWD/.qa-vault" pnpm tauri dev
 - GitHub Actions 工作流已配置；实际云端构建、真实云端兼容性、开发者证书签名与公证仍需在发布环境验证，不能由本地测试结果代替。
 
 本仓库的演示保险库、打包产物与本地检查资源放在被忽略的 `.qa-vault/`、`src-tauri/target/`、`.artifacts/` 中，不应将真实保险库或云端凭据加入仓库。
+
+## v2 存储与原生验证
+
+详细规则见 [存储与系统解锁](storage-security.md)。自动化测试中的凭据库为内存替身，不会访问宿主系统 Keychain 或 Hello。原生验证须在独立数据目录进行：确认系统解锁默认关闭；启用时确认主密码、实际完成系统验证；锁定后分别测试系统解锁与主密码；取消原生提示后验证主密码仍可用；关闭开关及换密后确认旧授权不能继续解锁。
+
+macOS 的 ad-hoc 构建不增加受限钥匙串授权组。Secure Enclave 私钥操作执行用户验证，login Keychain 保存不透明硬件密钥表示及密文；读取该条目本身不能解锁保险库。打包后需验证首次钥匙串提示、重启和更新构建后的行为。Windows 需确认设备支持 Passport 提供程序的认证强制策略与 RSA-OAEP；不支持时明确禁用，不使用不带 Hello 验证的回退。
+
+调试数据目录也参与凭据账户命名，切勿将真实密码或实际云配置用于演示目录。新版本不读取 v1 文件；如旧 `.qa-vault` 已存在，应新建一个空目录再调试。

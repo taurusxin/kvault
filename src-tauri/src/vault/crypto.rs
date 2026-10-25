@@ -7,45 +7,91 @@ use chacha20poly1305::{
 };
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 pub const MAX_FILE_SIZE: usize = 64 * 1024 * 1024;
+const MAGIC: &[u8; 8] = b"KVAULT\x02\0";
+const HEADER_SIZE: usize = 132;
+const WRAP_PREFIX_SIZE: usize = 84;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Header {
-    pub format: String,
-    pub version: u32,
     pub vault_id: String,
     pub epoch: u64,
-    pub kdf: String,
     pub memory: u32,
     pub iterations: u32,
     pub parallelism: u32,
     pub salt: String,
+    pub wrap_nonce: String,
+    pub wrapped_key: String,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Envelope {
-    header: Header,
-    purpose: String,
-    nonce: String,
-    ciphertext: String,
-}
-
+#[derive(Clone)]
 pub struct Keys {
     pub header: Header,
+    /// Random DEK. The password-derived KEK is never kept in the session.
     pub key: Zeroizing<[u8; 32]>,
 }
 
-impl Clone for Keys {
-    fn clone(&self) -> Self {
-        Self {
-            header: self.header.clone(),
-            key: Zeroizing::new(*self.key),
-        }
+fn invalid() -> AppError {
+    AppError::new(
+        "invalid_vault",
+        "保险库格式无效或文件损坏；仅支持新的 v2 二进制格式",
+    )
+}
+
+fn decode<const N: usize>(text: &str) -> Result<[u8; N]> {
+    STANDARD
+        .decode(text)
+        .map_err(|_| invalid())?
+        .try_into()
+        .map_err(|_| invalid())
+}
+
+fn encode_header(h: &Header) -> Result<Vec<u8>> {
+    if h.memory != 65536 || h.iterations != 3 || h.parallelism != 1 || h.epoch == 0 {
+        return Err(invalid());
     }
+    let uuid = uuid::Uuid::parse_str(&h.vault_id).map_err(|_| invalid())?;
+    let mut bytes = Vec::with_capacity(HEADER_SIZE);
+    bytes.extend_from_slice(MAGIC);
+    bytes.extend_from_slice(uuid.as_bytes());
+    bytes.extend_from_slice(&h.epoch.to_le_bytes());
+    bytes.extend_from_slice(&h.memory.to_le_bytes());
+    bytes.extend_from_slice(&h.iterations.to_le_bytes());
+    bytes.extend_from_slice(&h.parallelism.to_le_bytes());
+    bytes.extend_from_slice(&decode::<16>(&h.salt)?);
+    bytes.extend_from_slice(&decode::<24>(&h.wrap_nonce)?);
+    bytes.extend_from_slice(&decode::<48>(&h.wrapped_key)?);
+    Ok(bytes)
+}
+
+fn wrapping_aad(h: &Header) -> Result<Vec<u8>> {
+    let mut aad = b"kvault/v2/password-wrap\0".to_vec();
+    aad.extend_from_slice(&encode_header(h)?[..WRAP_PREFIX_SIZE]);
+    Ok(aad)
+}
+
+fn derive_kek(password: &str, header: &Header) -> Result<Zeroizing<[u8; 32]>> {
+    encode_header(header)?; // Bound KDF parameters before allocating memory.
+    let params = Params::new(
+        header.memory,
+        header.iterations,
+        header.parallelism,
+        Some(32),
+    )
+    .map_err(|_| invalid())?;
+    let mut key = Zeroizing::new([0; 32]);
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+        .hash_password_into(
+            password.as_bytes(),
+            &decode::<16>(&header.salt)?,
+            key.as_mut(),
+        )
+        .map_err(|_| invalid())?;
+    Ok(key)
 }
 
 impl Keys {
@@ -53,182 +99,196 @@ impl Keys {
         if password.chars().count() < 8 {
             return Err(AppError::invalid("主密码至少需要 8 个字符"));
         }
-        let mut salt = [0u8; 16];
+        let mut salt = [0; 16];
+        let mut wrap_nonce = [0; 24];
+        let mut key = Zeroizing::new([0; 32]);
         OsRng.fill_bytes(&mut salt);
-        Self::derive(
-            password,
-            Header {
-                format: "kvault".into(),
-                version: 1,
-                vault_id,
-                epoch,
-                kdf: "argon2id-v19".into(),
-                memory: 65536,
-                iterations: 3,
-                parallelism: 1,
-                salt: STANDARD.encode(salt),
-            },
-        )
+        OsRng.fill_bytes(&mut wrap_nonce);
+        OsRng.fill_bytes(key.as_mut());
+        let mut header = Header {
+            vault_id,
+            epoch,
+            memory: 65536,
+            iterations: 3,
+            parallelism: 1,
+            salt: STANDARD.encode(salt),
+            wrap_nonce: STANDARD.encode(wrap_nonce),
+            wrapped_key: STANDARD.encode([0; 48]),
+        };
+        let kek = derive_kek(password, &header)?;
+        let cipher = XChaCha20Poly1305::new_from_slice(kek.as_ref()).map_err(|_| invalid())?;
+        header.wrapped_key = STANDARD.encode(
+            cipher
+                .encrypt(
+                    XNonce::from_slice(&wrap_nonce),
+                    Payload {
+                        msg: key.as_ref(),
+                        aad: &wrapping_aad(&header)?,
+                    },
+                )
+                .map_err(|_| invalid())?,
+        );
+        Ok(Self { header, key })
     }
 
     pub fn derive(password: &str, header: Header) -> Result<Self> {
-        validate_header(&header)?;
-        let salt = STANDARD.decode(&header.salt).map_err(|_| invalid())?;
-        let params = Params::new(
-            header.memory,
-            header.iterations,
-            header.parallelism,
-            Some(32),
-        )
-        .map_err(|_| invalid())?;
+        let kek = derive_kek(password, &header)?;
+        let cipher = XChaCha20Poly1305::new_from_slice(kek.as_ref()).map_err(|_| invalid())?;
+        let plain = Zeroizing::new(
+            cipher
+                .decrypt(
+                    XNonce::from_slice(&decode::<24>(&header.wrap_nonce)?),
+                    Payload {
+                        msg: &decode::<48>(&header.wrapped_key)?,
+                        aad: &wrapping_aad(&header)?,
+                    },
+                )
+                .map_err(|_| AppError::new("decrypt", "密码不正确，或保险库内容已损坏"))?,
+        );
+        Self::from_device(header, &plain)
+    }
+
+    pub fn from_device(header: Header, secret: &[u8]) -> Result<Self> {
+        encode_header(&header)?;
         let mut key = Zeroizing::new([0; 32]);
-        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-            .hash_password_into(password.as_bytes(), &salt, key.as_mut())
-            .map_err(|_| invalid())?;
+        if secret.len() != 32 {
+            return Err(invalid());
+        }
+        key.copy_from_slice(secret);
         Ok(Self { header, key })
     }
 }
 
-fn invalid() -> AppError {
-    AppError::new("invalid_vault", "保险库格式无效、版本不受支持或文件已损坏")
-}
-fn validate_header(h: &Header) -> Result<()> {
-    if h.format != "kvault"
-        || h.version != 1
-        || h.kdf != "argon2id-v19"
-        || h.memory != 65536
-        || h.iterations != 3
-        || h.parallelism != 1
-        || h.epoch == 0
-        || uuid::Uuid::parse_str(&h.vault_id).is_err()
-        || STANDARD.decode(&h.salt).map_or(true, |s| s.len() != 16)
-    {
-        return Err(invalid());
-    }
-    Ok(())
+pub fn fingerprint(h: &Header) -> Result<String> {
+    Ok(format!("{:x}", Sha256::digest(encode_header(h)?)))
 }
 
-fn parse(bytes: &[u8], purpose: &str) -> Result<Envelope> {
-    if bytes.len() > MAX_FILE_SIZE {
-        return Err(AppError::invalid("保险库超过 64 MiB 文件上限"));
+fn purpose_id(purpose: &str) -> Result<u8> {
+    match purpose {
+        "local" => Ok(1),
+        "snapshot" => Ok(2),
+        "password-check" => Ok(3),
+        _ => Err(invalid()),
     }
-    let env: Envelope = serde_json::from_slice(bytes).map_err(|_| invalid())?;
-    validate_header(&env.header)?;
-    if env.purpose != purpose {
-        return Err(invalid());
-    }
-    Ok(env)
 }
 
 pub fn header(bytes: &[u8], purpose: &str) -> Result<Header> {
-    Ok(parse(bytes, purpose)?.header)
+    if bytes.len() > MAX_FILE_SIZE
+        || bytes.len() < HEADER_SIZE + 1 + 24 + 16
+        || &bytes[..8] != MAGIC
+        || bytes[HEADER_SIZE] != purpose_id(purpose)?
+    {
+        return Err(invalid());
+    }
+    let h = Header {
+        vault_id: uuid::Uuid::from_slice(&bytes[8..24])
+            .map_err(|_| invalid())?
+            .to_string(),
+        epoch: u64::from_le_bytes(bytes[24..32].try_into().map_err(|_| invalid())?),
+        memory: u32::from_le_bytes(bytes[32..36].try_into().map_err(|_| invalid())?),
+        iterations: u32::from_le_bytes(bytes[36..40].try_into().map_err(|_| invalid())?),
+        parallelism: u32::from_le_bytes(bytes[40..44].try_into().map_err(|_| invalid())?),
+        salt: STANDARD.encode(&bytes[44..60]),
+        wrap_nonce: STANDARD.encode(&bytes[60..84]),
+        wrapped_key: STANDARD.encode(&bytes[84..132]),
+    };
+    encode_header(&h)?;
+    Ok(h)
 }
 
 pub fn seal<T: Serialize>(value: &T, keys: &Keys, purpose: &str) -> Result<Vec<u8>> {
-    let plain = Zeroizing::new(serde_json::to_vec(value).map_err(AppError::storage)?);
-    let mut nonce = [0u8; 24];
+    let mut plain = Zeroizing::new(Vec::new());
+    ciborium::into_writer(value, &mut *plain).map_err(AppError::storage)?;
+    if plain.len() > MAX_FILE_SIZE - HEADER_SIZE - 41 {
+        return Err(invalid());
+    }
+    let mut bytes = encode_header(&keys.header)?;
+    bytes.push(purpose_id(purpose)?);
+    let mut nonce = [0; 24];
     OsRng.fill_bytes(&mut nonce);
-    let aad = serde_json::to_vec(&(&keys.header, purpose)).map_err(AppError::storage)?;
     let cipher = XChaCha20Poly1305::new_from_slice(keys.key.as_ref()).map_err(|_| invalid())?;
     let ciphertext = cipher
         .encrypt(
             XNonce::from_slice(&nonce),
             Payload {
                 msg: &plain,
-                aad: &aad,
+                aad: &bytes,
             },
         )
         .map_err(|_| invalid())?;
-    let bytes = serde_json::to_vec(&Envelope {
-        header: keys.header.clone(),
-        purpose: purpose.into(),
-        nonce: STANDARD.encode(nonce),
-        ciphertext: STANDARD.encode(ciphertext),
-    })
-    .map_err(AppError::storage)?;
-    if bytes.len() > MAX_FILE_SIZE {
-        return Err(AppError::invalid("保险库超过 64 MiB 文件上限"));
-    }
+    bytes.extend_from_slice(&nonce);
+    bytes.extend_from_slice(&ciphertext);
     Ok(bytes)
 }
 
 pub fn open<T: DeserializeOwned>(bytes: &[u8], keys: &Keys, purpose: &str) -> Result<T> {
-    let env = parse(bytes, purpose)?;
-    if env.header != keys.header {
+    if header(bytes, purpose)? != keys.header {
         return Err(AppError::new(
             "key_changed",
             "保险库密钥已变更，请输入新主密码",
         ));
     }
-    let nonce = STANDARD.decode(env.nonce).map_err(|_| invalid())?;
-    if nonce.len() != 24 {
-        return Err(invalid());
-    }
-    let ciphertext = STANDARD.decode(env.ciphertext).map_err(|_| invalid())?;
-    let aad = serde_json::to_vec(&(&env.header, purpose)).map_err(AppError::storage)?;
+    let nonce_start = HEADER_SIZE + 1;
     let cipher = XChaCha20Poly1305::new_from_slice(keys.key.as_ref()).map_err(|_| invalid())?;
     let plain = Zeroizing::new(
         cipher
             .decrypt(
-                XNonce::from_slice(&nonce),
+                XNonce::from_slice(&bytes[nonce_start..nonce_start + 24]),
                 Payload {
-                    msg: &ciphertext,
-                    aad: &aad,
+                    msg: &bytes[nonce_start + 24..],
+                    aad: &bytes[..nonce_start],
                 },
             )
-            .map_err(|_| AppError::new("decrypt", "密码不正确，或保险库内容已损坏"))?,
+            .map_err(|_| AppError::new("decrypt", "无法认证保险库内容，文件可能已损坏"))?,
     );
-    serde_json::from_slice(&plain).map_err(|_| invalid())
+    let mut reader = std::io::Cursor::new(plain.as_slice());
+    let value = ciborium::from_reader(&mut reader).map_err(|_| invalid())?;
+    if reader.position() as usize != plain.len() {
+        return Err(invalid());
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn authenticated_roundtrip_and_random_nonce() {
+    fn authenticated_binary_roundtrip_and_wrapped_random_dek() {
         let keys = Keys::new("test-password", uuid::Uuid::new_v4().to_string(), 1).unwrap();
         let a = seal(&"secret value", &keys, "snapshot").unwrap();
         let b = seal(&"secret value", &keys, "snapshot").unwrap();
         assert_ne!(a, b);
+        assert!(a.starts_with(MAGIC));
         assert!(!String::from_utf8_lossy(&a).contains("secret value"));
+        let unlocked = Keys::derive("test-password", header(&a, "snapshot").unwrap()).unwrap();
         assert_eq!(
-            open::<String>(&a, &keys, "snapshot").unwrap(),
+            open::<String>(&a, &unlocked, "snapshot").unwrap(),
             "secret value"
         );
-        let wrong = Keys::derive("wrong-password", keys.header.clone()).unwrap();
-        assert!(open::<String>(&a, &wrong, "snapshot").is_err());
-        let mut envelope: serde_json::Value = serde_json::from_slice(&a).unwrap();
-        envelope["header"]["epoch"] = 2.into();
-        assert!(
-            open::<String>(&serde_json::to_vec(&envelope).unwrap(), &keys, "snapshot").is_err()
+        assert!(Keys::derive("wrong-password", keys.header.clone()).is_err());
+        let device = Keys::from_device(keys.header.clone(), keys.key.as_ref()).unwrap();
+        assert_eq!(
+            open::<String>(&a, &device, "snapshot").unwrap(),
+            "secret value"
         );
-        envelope = serde_json::from_slice(&a).unwrap();
-        let mut ciphertext = STANDARD
-            .decode(envelope["ciphertext"].as_str().unwrap())
-            .unwrap();
-        ciphertext[0] ^= 1;
-        envelope["ciphertext"] = STANDARD.encode(ciphertext).into();
-        assert!(
-            open::<String>(&serde_json::to_vec(&envelope).unwrap(), &keys, "snapshot").is_err()
-        );
+        for offset in [8, 24, 44, 60, 84, HEADER_SIZE, HEADER_SIZE + 1, a.len() - 1] {
+            let mut tampered = a.clone();
+            tampered[offset] ^= 1;
+            assert!(open::<String>(&tampered, &keys, "snapshot").is_err());
+            if offset < HEADER_SIZE
+                && let Ok(h) = header(&tampered, "snapshot")
+            {
+                assert!(Keys::derive("test-password", h).is_err());
+            }
+        }
         assert!(open::<String>(&a, &keys, "local").is_err());
+        assert!(header(b"{\"header\":{\"version\":1}}", "local").is_err());
     }
     #[test]
     fn reject_unbounded_kdf_before_derivation() {
-        let mut h = Header {
-            format: "kvault".into(),
-            version: 1,
-            vault_id: uuid::Uuid::new_v4().to_string(),
-            epoch: 1,
-            kdf: "argon2id-v19".into(),
-            memory: u32::MAX,
-            iterations: 3,
-            parallelism: 1,
-            salt: STANDARD.encode([0; 16]),
-        };
-        assert!(Keys::derive("password", h.clone()).is_err());
-        h.memory = 65536;
-        h.version = 2;
-        assert!(Keys::derive("password", h).is_err());
+        let keys = Keys::new("test-password", uuid::Uuid::new_v4().to_string(), 1).unwrap();
+        let mut h = keys.header;
+        h.memory = u32::MAX;
+        assert!(Keys::derive("test-password", h).is_err());
     }
 }

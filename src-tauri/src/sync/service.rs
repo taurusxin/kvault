@@ -83,6 +83,9 @@ pub async fn sync_inner(state: &Shared, app: &impl Events, session_id: u64) -> R
     let (keys, config, cancel) = {
         let vault = state.vault.lock().map_err(AppError::storage)?;
         let session = vault.check(session_id)?;
+        if let Some(message) = &session.state.credential_error {
+            return Err(AppError::new("credential_store", message));
+        }
         if session.state.rotation.is_some() {
             return Err(AppError::new(
                 "recovery_pending",

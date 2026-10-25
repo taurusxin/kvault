@@ -3,11 +3,13 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { compareEntryOrder } from "@/lib/types";
 import type {
   Action,
+  AutoLockSettings,
   Bootstrap,
   Draft,
   Entry,
   Snapshot,
   SyncStatus,
+  SystemUnlock,
 } from "@/lib/types";
 
 export const desktop = isTauri();
@@ -28,6 +30,9 @@ interface VaultStore {
   exists: boolean;
   platform: string;
   snapshot: Snapshot | null;
+  // Only the non-sensitive lock-screen hint survives locking, in memory only.
+  autoLockHint: AutoLockSettings | null;
+  systemUnlock: SystemUnlock | null;
   lifecycle: number;
   selectedTable: string | null;
   selectedEntry: string | null;
@@ -77,6 +82,8 @@ export const useVault = create<VaultStore>((set, get) => ({
   exists: false,
   platform: "",
   snapshot: null,
+  autoLockHint: null,
+  systemUnlock: null,
   lifecycle: 0,
   selectedTable: null,
   selectedEntry: null,
@@ -98,7 +105,13 @@ export const useVault = create<VaultStore>((set, get) => ({
       return;
     }
     const boot = await invoke<Bootstrap>("bootstrap");
-    set({ initialized: true, exists: boot.exists, platform: boot.platform });
+    set((state) => ({
+      initialized: true,
+      exists: boot.exists,
+      platform: boot.platform,
+      autoLockHint: state.snapshot?.autoLock ?? boot.preferences.autoLock,
+      systemUnlock: state.snapshot?.systemUnlock ?? boot.systemUnlock,
+    }));
   },
   accept: (snapshot, fresh = false) => {
     const current = get();
@@ -109,9 +122,12 @@ export const useVault = create<VaultStore>((set, get) => ({
         current.snapshot.revision > snapshot.revision)
     )
       return;
+    const autoLockHint = { ...snapshot.autoLock };
     if (fresh) {
       set({
         snapshot,
+        autoLockHint,
+        systemUnlock: snapshot.systemUnlock,
         exists: true,
         selectedTable: null,
         selectedEntry: null,
@@ -126,20 +142,24 @@ export const useVault = create<VaultStore>((set, get) => ({
         query: "",
         busy: false,
         sync: {
-          state: snapshot.recoveryPending
-            ? "recovery"
-            : snapshot.conflicts.length
-              ? "conflict"
+          state: snapshot.credentialError
+            ? "error"
+            : snapshot.recoveryPending
+              ? "recovery"
+              : snapshot.conflicts.length
+                ? "conflict"
+                : snapshot.config
+                  ? snapshot.dirty
+                    ? "pending"
+                    : "synced"
+                  : "local",
+          message:
+            snapshot.credentialError ??
+            (snapshot.recoveryPending
+              ? "密码变更待恢复"
               : snapshot.config
-                ? snapshot.dirty
-                  ? "pending"
-                  : "synced"
-                : "local",
-          message: snapshot.recoveryPending
-            ? "密码变更待恢复"
-            : snapshot.config
-              ? "保险库已解锁"
-              : "已保存在本地",
+                ? "保险库已解锁"
+                : "已保存在本地"),
           lastSyncedAt: snapshot.lastSyncedAt,
         },
       });
@@ -183,6 +203,8 @@ export const useVault = create<VaultStore>((set, get) => ({
     }
     set({
       snapshot,
+      autoLockHint,
+      systemUnlock: snapshot.systemUnlock,
       orderDraft,
       orderDirty: orderDraft
         ? JSON.stringify(orderDraft.ids) !==

@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 
 pub const REMOTE_NAME: &str = "vault.kvault";
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, PartialEq, Eq, Serialize, Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop,
+)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -82,37 +84,20 @@ impl SyncConfig {
         Ok(())
     }
     pub fn redacted(&self) -> Self {
-        match self.clone() {
+        let mut result = self.clone();
+        match &mut result {
             Self::S3 {
-                endpoint,
-                region,
-                bucket,
-                access_key,
-                prefix,
-                path_style,
+                secret_key,
+                session_token,
                 ..
-            } => Self::S3 {
-                endpoint,
-                region,
-                bucket,
-                access_key,
-                secret_key: String::new(),
-                session_token: None,
-                prefix,
-                path_style,
-            },
-            Self::Webdav {
-                endpoint,
-                directory,
-                username,
-                ..
-            } => Self::Webdav {
-                endpoint,
-                directory,
-                username,
-                password: String::new(),
-            },
+            } => {
+                zeroize::Zeroize::zeroize(secret_key);
+                zeroize::Zeroize::zeroize(session_token);
+                *session_token = None;
+            }
+            Self::Webdav { password, .. } => zeroize::Zeroize::zeroize(password),
         }
+        result
     }
 }
 

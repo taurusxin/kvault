@@ -1,18 +1,46 @@
-import { createContext, useContext, useLayoutEffect, useState } from "react";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { toast } from "sonner";
+import { errorMessage, type Preferences } from "@/lib/types";
 type Theme = "light" | "dark" | "system";
 const ThemeContext = createContext<{
   theme: Theme;
   setTheme: (theme: Theme) => void;
 }>({ theme: "system", setTheme: () => {} });
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  const [theme, setTheme] = useState<Theme>(() => {
-    try {
-      const saved = localStorage.getItem("kvault-theme");
-      return saved === "light" || saved === "dark" ? saved : "system";
-    } catch {
-      return "system";
-    }
-  });
+  const [theme, applyTheme] = useState<Theme>("system");
+  const revision = useRef(0);
+  useEffect(() => {
+    if (!isTauri()) return;
+    let active = true;
+    const version = revision.current;
+    void invoke<Preferences>("get_preferences")
+      .then((prefs) => {
+        if (active && revision.current === version && prefs)
+          applyTheme(prefs.theme);
+      })
+      .catch(() => {}); // Bootstrap presents invalid-config errors in the main UI.
+    return () => {
+      active = false;
+    };
+  }, []);
+  const setTheme = (next: Theme) => {
+    const previous = theme;
+    const version = ++revision.current;
+    applyTheme(next);
+    if (isTauri())
+      void invoke("set_theme", { theme: next }).catch((error) => {
+        if (revision.current === version) applyTheme(previous);
+        toast.error(errorMessage(error));
+      });
+  };
   useLayoutEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const apply = () => {
@@ -23,11 +51,6 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     };
     apply();
     media.addEventListener("change", apply);
-    try {
-      localStorage.setItem("kvault-theme", theme);
-    } catch {
-      /* Appearance can remain in memory if storage is unavailable. */
-    }
     return () => media.removeEventListener("change", apply);
   }, [theme]);
   return (

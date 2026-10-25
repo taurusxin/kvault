@@ -1,6 +1,7 @@
 pub mod crypto;
 pub mod import;
 pub mod model;
+pub mod preferences;
 pub mod storage;
 #[cfg(test)]
 mod tests;
@@ -41,6 +42,7 @@ pub struct Vault {
 pub struct AppState {
     pub vault: Mutex<Vault>,
     pub sync_gate: tokio::sync::Mutex<()>,
+    pub auth_gate: tokio::sync::Mutex<()>,
     pub due: AtomicU64,
     pub failures: AtomicU64,
 }
@@ -56,6 +58,7 @@ impl AppState {
                 activity_wall: now(),
             }),
             sync_gate: tokio::sync::Mutex::new(()),
+            auth_gate: tokio::sync::Mutex::new(()),
             due: AtomicU64::new(0),
             failures: AtomicU64::new(0),
         }
@@ -140,9 +143,12 @@ impl Vault {
             dirty: session.state.dirty,
             recovery_pending: session.state.rotation.is_some(),
             auto_lock: session.state.auto_lock.clone(),
+            system_unlock: self.storage.system_unlock(Some(&session.keys.header))?,
+            credential_error: session.state.credential_error.clone(),
         })
     }
-    pub fn install(&mut self, keys: Keys, state: LocalState) -> Result<Snapshot> {
+    pub fn install(&mut self, keys: Keys, mut state: LocalState) -> Result<Snapshot> {
+        state.auto_lock = self.storage.preferences()?.auto_lock;
         state.auto_lock.validate()?;
         if let Some(old) = self.session.take() {
             old.cancel.cancel();
@@ -156,15 +162,28 @@ impl Vault {
         });
         self.snapshot()
     }
-    pub fn persist(&mut self, state: LocalState) -> Result<()> {
+    pub fn persist(&mut self, mut state: LocalState) -> Result<()> {
         let session = self.session.as_ref().ok_or_else(AppError::locked)?;
         self.storage.save(&state, &session.keys)?;
+        self.storage
+            .cleanup_profiles(&mut state, &session.keys.header.vault_id);
         self.session.as_mut().ok_or_else(AppError::locked)?.state = state;
         Ok(())
     }
     pub fn mutate(&mut self, session_id: u64, action: Action) -> Result<Snapshot> {
         let local_only = matches!(&action, Action::SetAutoLock { .. });
+        let sync_change = matches!(&action, Action::SetSync { .. });
         let session = self.check(session_id)?;
+        if let Action::SetAutoLock { settings } = &action {
+            settings.validate()?;
+            self.storage
+                .update_preferences(|p| p.auto_lock = settings.clone())?;
+            let session = self.session.as_mut().ok_or_else(AppError::locked)?;
+            session.state.auto_lock = settings.clone();
+            session.state.revision += 1;
+            self.touch();
+            return self.snapshot();
+        }
         if session.state.rotation.is_some() {
             return Err(AppError::new(
                 "recovery_pending",
@@ -391,7 +410,21 @@ impl Vault {
                 }
             }
             Action::SetSync { config } => {
+                let vault_id = self
+                    .session
+                    .as_ref()
+                    .ok_or_else(AppError::locked)?
+                    .keys
+                    .header
+                    .vault_id
+                    .clone();
+                let profile = self.storage.save_sync(&vault_id, config.as_ref())?;
+                if let Some(previous) = state.sync_profile.take() {
+                    state.retired_profiles.push(previous);
+                }
+                state.sync_profile = profile;
                 state.config = config;
+                state.credential_error = None;
                 state.baseline = Document::default();
                 state.etag = None;
                 state.last_synced_at = None;
@@ -426,7 +459,24 @@ impl Vault {
         if !local_only {
             state.dirty = true;
         }
-        self.persist(state)?;
+        let pending_profile = if sync_change {
+            state.sync_profile.clone()
+        } else {
+            None
+        };
+        if let Err(error) = self.persist(state) {
+            if let Some(profile) = pending_profile {
+                let vault_id = &self
+                    .session
+                    .as_ref()
+                    .ok_or_else(AppError::locked)?
+                    .keys
+                    .header
+                    .vault_id;
+                let _ = self.storage.delete_sync(vault_id, Some(&profile));
+            }
+            return Err(error);
+        }
         self.touch();
         self.snapshot()
     }
@@ -558,6 +608,8 @@ pub struct Bootstrap {
     pub exists: bool,
     pub recovery_pending: bool,
     pub platform: String,
+    pub preferences: preferences::Preferences,
+    pub system_unlock: crate::security::SystemUnlock,
 }
 
 fn table_name(doc: &Document, name: &str, exclude: Option<&str>) -> Result<String> {

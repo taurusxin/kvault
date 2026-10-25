@@ -62,6 +62,20 @@ export interface Snapshot {
   dirty: boolean;
   recoveryPending: boolean;
   autoLock: AutoLockSettings;
+  systemUnlock: SystemUnlock;
+  credentialError: string | null;
+}
+export interface SystemUnlock {
+  available: boolean;
+  enabled: boolean;
+  label: string;
+  reason: string | null;
+}
+export interface Preferences {
+  version: number;
+  theme: "light" | "dark" | "system";
+  autoLock: AutoLockSettings;
+  systemUnlock: string | null;
 }
 export interface AutoLockSettings {
   enabled: boolean;
@@ -71,6 +85,8 @@ export interface Bootstrap {
   exists: boolean;
   recoveryPending: boolean;
   platform: string;
+  preferences: Preferences;
+  systemUnlock: SystemUnlock;
 }
 export interface SyncStatus {
   state: string;

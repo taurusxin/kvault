@@ -95,20 +95,13 @@ fn idle_timeout_also_counts_wall_time_across_system_sleep() {
 }
 
 #[test]
-fn auto_lock_settings_are_local_encrypted_and_compatible_with_older_vaults() {
+fn auto_lock_settings_are_plaintext_device_preferences_and_do_not_rewrite_business_data() {
     let (mut vault, _dir) = fixture();
     let sid = vault.generation;
     let mut state = vault.session.as_ref().unwrap().state.clone();
-    let mut legacy = serde_json::to_value(&state).unwrap();
-    legacy.as_object_mut().unwrap().remove("autoLock");
-    assert_eq!(
-        serde_json::from_value::<LocalState>(legacy)
-            .unwrap()
-            .auto_lock,
-        AutoLockSettings::default()
-    );
     state.dirty = false;
     vault.persist(state).unwrap();
+    let original_bytes = vault.storage.read(&vault.storage.path()).unwrap();
     let before = vault.snapshot().unwrap();
     let settings = AutoLockSettings {
         enabled: false,
@@ -127,9 +120,18 @@ fn auto_lock_settings_are_local_encrypted_and_compatible_with_older_vaults() {
     assert_eq!(snapshot.revision, before.revision + 1);
     let session = vault.session.as_ref().unwrap();
     let bytes = vault.storage.read(&vault.storage.path()).unwrap();
+    assert_eq!(bytes, original_bytes);
     assert!(!String::from_utf8_lossy(&bytes).contains("autoLock"));
-    let restored: LocalState = crypto::open(&bytes, &session.keys, "local").unwrap();
+    let mut restored: LocalState = crypto::open(&bytes, &session.keys, "local").unwrap();
+    assert_eq!(restored.auto_lock, AutoLockSettings::default());
+    vault
+        .storage
+        .restore_device_state(&mut restored, &session.keys.header.vault_id)
+        .unwrap();
     assert_eq!(restored.auto_lock, settings);
+    let plaintext = std::fs::read_to_string(vault.storage.dir.join("config.json")).unwrap();
+    assert!(plaintext.contains("timeoutMinutes"));
+    assert!(!plaintext.contains("document"));
     assert_eq!(restored.document, session.state.document);
     assert!(
         serde_json::to_value(&restored.document)

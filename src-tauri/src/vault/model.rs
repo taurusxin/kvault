@@ -45,7 +45,7 @@ pub struct Document {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AutoLockSettings {
     pub enabled: bool,
     pub timeout_minutes: u32,
@@ -75,7 +75,10 @@ impl AutoLockSettings {
 #[serde(rename_all = "camelCase")]
 pub struct LocalState {
     pub document: Document,
+    #[serde(skip)]
     pub config: Option<SyncConfig>,
+    pub sync_profile: Option<String>,
+    pub retired_profiles: Vec<String>,
     pub baseline: Document,
     pub etag: Option<String>,
     pub conflicts: Vec<Conflict>,
@@ -84,8 +87,10 @@ pub struct LocalState {
     pub dirty: bool,
     #[serde(default)]
     pub rotation: Option<Rotation>,
-    #[serde(default)]
+    #[serde(skip)]
     pub auto_lock: AutoLockSettings,
+    #[serde(skip)]
+    pub credential_error: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -101,6 +106,8 @@ impl Default for LocalState {
         Self {
             document: Document::default(),
             config: None,
+            sync_profile: None,
+            retired_profiles: vec![],
             baseline: Document::default(),
             etag: None,
             conflicts: vec![],
@@ -109,6 +116,7 @@ impl Default for LocalState {
             dirty: true,
             rotation: None,
             auto_lock: AutoLockSettings::default(),
+            credential_error: None,
         }
     }
 }
@@ -128,6 +136,8 @@ pub struct Snapshot {
     pub dirty: bool,
     pub recovery_pending: bool,
     pub auto_lock: AutoLockSettings,
+    pub system_unlock: crate::security::SystemUnlock,
+    pub credential_error: Option<String>,
 }
 
 #[derive(Deserialize)]
