@@ -1,4 +1,4 @@
-# kvault 技术报告
+# KVault 技术报告
 
 [返回项目首页](../README.md) · [使用指南](user-guide.md) · [开发指南](development.md)
 
@@ -42,6 +42,10 @@ flowchart LR
 - 记录编辑和排序采用显式保存。批量导入、移动、删除、排序先在状态副本上校验，再一次性加密落盘；校验失败不提交部分结果。
 - 数据提交增加本地修订号，并在本地保存完成后安排同步。具体交互规则见[使用指南](user-guide.md)。
 
+自动锁定策略作为本机 `LocalState.autoLock` 设置加密持久化，默认开启、闲置 5 分钟，可关闭或设置为 1–1440 分钟的整数。旧保险库缺少此字段时使用默认值。该设置不进入业务 `Document`、云端快照或导出备份；单独修改策略不会将业务数据标为待同步。导入备份会恢复默认策略。
+
+后端同时检查单调时钟与墙上时钟，覆盖系统休眠期间的闲置时间。后台任务在实际锁定时重新检查当前策略与最近活动，避免刚关闭自动锁定或重新操作后仍被过期检查结果锁定。保存策略后重新开始计时，关闭自动锁定不影响手动锁定或退出时清理会话。
+
 ## 本地持久化与备份
 
 保险库位于 Tauri 的应用数据目录下，标识为 `com.taurusxin.kvault`：
@@ -56,7 +60,7 @@ flowchart LR
 
 - KDF：Argon2id v19，64 MiB，3 次迭代，并行度 1，16 字节随机盐，32 字节输出。
 - AEAD：XChaCha20-Poly1305，每次写入生成新的 24 字节随机 nonce。
-- 本地用途为 `local`：加密表、记录、自定义排序、时间戳、删除墓碑、同步凭据、合并基线、冲突与恢复状态。
+- 本地用途为 `local`：加密表、记录、自定义排序、时间戳、删除墓碑、同步凭据、自动锁定策略、合并基线、冲突与恢复状态。
 - 云端与导出用途为 `snapshot`：只包含加密业务文档，不包含云凭据、本机同步状态或冲突。
 
 会话密钥仅在 Rust 内存中保存并使用 `Zeroizing` 清零；前端解锁后持有展示所需的明文，锁定时卸载编辑界面并清空 Zustand 状态。JavaScript 运行时与操作系统不保证所有历史内存副本、交换文件或系统剪贴板都被安全擦除。
@@ -133,7 +137,7 @@ flowchart LR
 ## IPC 与会话隔离
 
 - 生命周期：`bootstrap`、`create_vault`、`unlock_vault`、`lock_vault`、`touch_vault`。
-- 数据：`mutate_vault` 接收表 CRUD、记录 CRUD/移动、`reorderEntries` 自定义排序、`moveEntries` / `deleteEntries` 原子批量操作、`importEntries` 批量导入、同步设置及冲突解决动作；`copy_key`、`copy_value` 在 Rust 写入剪贴板。`select_import_csv` 打开原生 CSV 选择器，`preview_import` 解析并返回预览及行级错误。
+- 数据：`mutate_vault` 接收表 CRUD、记录 CRUD/移动、`reorderEntries` 自定义排序、`moveEntries` / `deleteEntries` 原子批量操作、`importEntries` 批量导入、`setAutoLock` 本机自动锁定策略、同步设置及冲突解决动作；`copy_key`、`copy_value` 在 Rust 写入剪贴板。`select_import_csv` 打开原生 CSV 选择器，`preview_import` 解析并返回预览及行级错误。
 - 云端：`test_connection`、`connect_remote`、`sync_now`。
 - 安全：`change_password`、`migrate_password`、`export_backup`、`import_backup`。
 - 事件：`vault:changed`、`vault:locked`、`sync:status`。错误统一为 `{ code, message }`，不回传服务密钥。

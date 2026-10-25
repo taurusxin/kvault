@@ -218,6 +218,7 @@ pub async fn mutate_vault(
     session_id: u64,
     mut action: Action,
 ) -> Result<Snapshot> {
+    let local_only = matches!(&action, Action::SetAutoLock { .. });
     if let Action::SetSync {
         config: Some(config),
     } = &mut action
@@ -260,6 +261,10 @@ pub async fn mutate_vault(
             .mutate(session_id, action)
     })
     .await?;
+    if local_only {
+        changed(&app, &snapshot);
+        return Ok(snapshot);
+    }
     state.schedule(2000);
     changed(&app, &snapshot);
     status(
@@ -719,7 +724,7 @@ pub async fn export_backup(state: State<'_, Shared>, session_id: u64) -> Result<
     };
     let Some(file) = rfd::AsyncFileDialog::new()
         .set_title("导出加密备份")
-        .add_filter("kvault 保险库", &["kvault"])
+        .add_filter("KVault 保险库", &["kvault"])
         .set_file_name("kvault-backup.kvault")
         .save_file()
         .await
@@ -757,7 +762,7 @@ pub async fn import_backup(
     };
     let Some(file) = rfd::AsyncFileDialog::new()
         .set_title("导入加密保险库")
-        .add_filter("kvault 保险库", &["kvault"])
+        .add_filter("KVault 保险库", &["kvault"])
         .pick_file()
         .await
     else {

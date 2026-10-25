@@ -23,6 +23,8 @@ Windows 使用 WebView2；Linux 需要 WebKitGTK 4.1、GTK 3 和相应构建依�
 
 前端为 React / TypeScript / Tailwind CSS 4，使用 shadcn/ui `radix-nova`、Lucide、Zustand。Rust 按 `vault`、`sync`、`commands` 组织；前端通过 Tauri IPC 调用后端，不直接读写文件或连接云存储。
 
+应用展示名称为 **KVault**。包名 `kvault`、Rust 库名 `kvault_lib`、应用标识符 `com.taurusxin.kvault` 及现有数据路径保持小写命名。
+
 macOS 使用 32px 紧凑标题栏和原生红绿灯；Windows、Linux 保留自绘窗口按钮。图标源稿为 `public/icon.svg`，采用 1024px 透明画布与 824px 圆角底板，保留 Dock 所需的外部留白。`pnpm icons` 同步更新 PNG、Windows ICO 和 macOS ICNS；移动端资源只在临时目录生成后清理。
 
 ## 目录结构

@@ -10,7 +10,10 @@ use crate::{
     sync::{Conflict, Entity, SyncConfig},
 };
 use crypto::Keys;
-use model::{Document, Entry, EntryInput, LocalState, Snapshot, Table, id, now, validate_document};
+use model::{
+    AutoLockSettings, Document, Entry, EntryInput, LocalState, Snapshot, Table, id, now,
+    validate_document,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -59,12 +62,18 @@ impl AppState {
     }
     pub fn lock(&self) -> Result<()> {
         let mut vault = self.vault.lock().map_err(AppError::storage)?;
-        if let Some(session) = vault.session.take() {
-            session.cancel.cancel();
-        }
-        vault.generation += 1;
+        vault.lock();
         self.due.store(0, Ordering::SeqCst);
         Ok(())
+    }
+    pub fn lock_if_idle(&self) -> Result<bool> {
+        let mut vault = self.vault.lock().map_err(AppError::storage)?;
+        if !vault.idle_due() {
+            return Ok(false);
+        }
+        vault.lock();
+        self.due.store(0, Ordering::SeqCst);
+        Ok(true)
     }
     pub fn schedule(&self, delay: u64) {
         self.due.store(now() + delay, Ordering::SeqCst);
@@ -77,14 +86,24 @@ impl AppState {
 }
 
 impl Vault {
+    fn lock(&mut self) {
+        if let Some(session) = self.session.take() {
+            session.cancel.cancel();
+        }
+        self.generation += 1;
+    }
     pub fn touch(&mut self) {
         self.activity = Instant::now();
         self.activity_wall = now();
     }
     pub fn idle_due(&self) -> bool {
-        self.session.is_some()
-            && (self.activity.elapsed().as_secs() >= 300
-                || now().saturating_sub(self.activity_wall) >= 300000)
+        self.session.as_ref().is_some_and(|session| {
+            let settings = &session.state.auto_lock;
+            let timeout = u64::from(settings.timeout_minutes) * 60;
+            settings.enabled
+                && (self.activity.elapsed().as_secs() >= timeout
+                    || now().saturating_sub(self.activity_wall) >= timeout * 1000)
+        })
     }
     pub fn check(&self, session_id: u64) -> Result<&Session> {
         if self.generation != session_id {
@@ -120,9 +139,11 @@ impl Vault {
             last_synced_at: session.state.last_synced_at,
             dirty: session.state.dirty,
             recovery_pending: session.state.rotation.is_some(),
+            auto_lock: session.state.auto_lock.clone(),
         })
     }
     pub fn install(&mut self, keys: Keys, state: LocalState) -> Result<Snapshot> {
+        state.auto_lock.validate()?;
         if let Some(old) = self.session.take() {
             old.cancel.cancel();
         }
@@ -142,6 +163,7 @@ impl Vault {
         Ok(())
     }
     pub fn mutate(&mut self, session_id: u64, action: Action) -> Result<Snapshot> {
+        let local_only = matches!(&action, Action::SetAutoLock { .. });
         let session = self.check(session_id)?;
         if session.state.rotation.is_some() {
             return Err(AppError::new(
@@ -149,12 +171,20 @@ impl Vault {
                 "密码变更尚待核验，请先完成恢复",
             ));
         }
-        if !session.state.conflicts.is_empty() && !matches!(action, Action::ResolveConflict { .. })
+        if !session.state.conflicts.is_empty()
+            && !matches!(
+                &action,
+                Action::ResolveConflict { .. } | Action::SetAutoLock { .. }
+            )
         {
             return Err(AppError::new("conflict", "请先解决同步冲突，再修改保险库"));
         }
         let mut state = session.state.clone();
         match action {
+            Action::SetAutoLock { settings } => {
+                settings.validate()?;
+                state.auto_lock = settings;
+            }
             Action::CreateTable { name } => {
                 let name = table_name(&state.document, &name, None)?;
                 state.document.tables.push(Table {
@@ -393,7 +423,9 @@ impl Vault {
             validate_document(&state.document)?;
         }
         state.revision += 1;
-        state.dirty = true;
+        if !local_only {
+            state.dirty = true;
+        }
         self.persist(state)?;
         self.touch();
         self.snapshot()
@@ -455,6 +487,9 @@ impl Vault {
     rename_all_fields = "camelCase"
 )]
 pub enum Action {
+    SetAutoLock {
+        settings: AutoLockSettings,
+    },
     CreateTable {
         name: String,
     },

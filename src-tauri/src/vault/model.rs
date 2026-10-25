@@ -44,6 +44,33 @@ pub struct Document {
     pub entries: Vec<Entry>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoLockSettings {
+    pub enabled: bool,
+    pub timeout_minutes: u32,
+}
+
+impl Default for AutoLockSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout_minutes: 5,
+        }
+    }
+}
+
+impl AutoLockSettings {
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if !(1..=1440).contains(&self.timeout_minutes) {
+            return Err(crate::error::AppError::invalid(
+                "自动锁定时长须为 1–1440 分钟的整数",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalState {
@@ -57,6 +84,8 @@ pub struct LocalState {
     pub dirty: bool,
     #[serde(default)]
     pub rotation: Option<Rotation>,
+    #[serde(default)]
+    pub auto_lock: AutoLockSettings,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -79,6 +108,7 @@ impl Default for LocalState {
             last_synced_at: None,
             dirty: true,
             rotation: None,
+            auto_lock: AutoLockSettings::default(),
         }
     }
 }
@@ -97,6 +127,7 @@ pub struct Snapshot {
     pub last_synced_at: Option<u64>,
     pub dirty: bool,
     pub recovery_pending: bool,
+    pub auto_lock: AutoLockSettings,
 }
 
 #[derive(Deserialize)]

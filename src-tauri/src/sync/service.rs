@@ -248,9 +248,10 @@ pub fn start_worker(state: Shared, app: AppHandle) {
                 (false, None)
             };
             if idle {
-                let _ = state.lock();
-                let _ = app.emit("vault:locked", ());
-                status(&app, "locked", "保险库已自动锁定", None);
+                if state.lock_if_idle().unwrap_or(false) {
+                    let _ = app.emit("vault:locked", ());
+                    status(&app, "locked", "保险库已自动锁定", None);
+                }
                 continue;
             }
             let due = state.due.load(Ordering::SeqCst);

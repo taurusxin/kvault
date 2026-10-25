@@ -43,6 +43,7 @@ const fixture = (): Snapshot => ({
   config: null,
   conflicts: [],
   recoveryPending: false,
+  autoLock: { enabled: true, timeoutMinutes: 5 },
   tables: [
     { id: "table", name: "工作", deleted: false, createdAt: 1, updatedAt: 1 },
   ],
@@ -110,6 +111,10 @@ describe("保险库界面与会话", () => {
           name: configured ? /^WebDAV 同步/ : /连接云存储/,
         }),
       );
+      expect(screen.getByRole("tablist", { name: "设置分类" })).toHaveAttribute(
+        "aria-orientation",
+        "vertical",
+      );
       expect(screen.getByRole("tab", { name: "云同步" })).toHaveAttribute(
         "aria-selected",
         "true",
@@ -136,6 +141,100 @@ describe("保险库界面与会话", () => {
       );
     },
   );
+  it("自动锁定可配置时长和开关，保存后重新打开仍显示已保存设置", async () => {
+    let saved = fixture();
+    useVault.getState().accept(saved, true);
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "bootstrap")
+        return { exists: true, recoveryPending: false, platform: "macos" };
+      if (command === "mutate_vault") {
+        const action = (
+          args as { action: { type: string; settings: Snapshot["autoLock"] } }
+        ).action;
+        saved = {
+          ...saved,
+          autoLock: action.settings,
+          revision: saved.revision + 1,
+        };
+        return saved;
+      }
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "设置" }));
+    expect(screen.getByRole("switch", { name: "自动锁定" })).toBeChecked();
+    fireEvent.change(screen.getByRole("spinbutton", { name: "闲置时长" }), {
+      target: { value: "30" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
+    await waitFor(() =>
+      expect(useVault.getState().snapshot?.autoLock).toEqual({
+        enabled: true,
+        timeoutMinutes: 30,
+      }),
+    );
+    expect(invoke).toHaveBeenCalledWith("mutate_vault", {
+      sessionId: 1,
+      action: {
+        type: "setAutoLock",
+        settings: { enabled: true, timeoutMinutes: 30 },
+      },
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: "自动锁定" })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("switch", { name: "自动锁定" }));
+    expect(screen.getByRole("spinbutton", { name: "闲置时长" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
+    await waitFor(() =>
+      expect(useVault.getState().snapshot?.autoLock).toEqual({
+        enabled: false,
+        timeoutMinutes: 30,
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: "自动锁定" })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    expect(screen.getByRole("switch", { name: "自动锁定" })).not.toBeChecked();
+    expect(screen.getByRole("spinbutton", { name: "闲置时长" })).toHaveValue(
+      30,
+    );
+    expect(screen.getByRole("button", { name: "保存设置" })).toBeDisabled();
+  });
+  it("自动锁定拒绝无效时长，保存失败时保留原设置和待重试输入", async () => {
+    useVault.getState().accept(fixture(), true);
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "bootstrap")
+        return { exists: true, recoveryPending: false, platform: "macos" };
+      if (command === "mutate_vault")
+        throw { code: "storage", message: "无法写入保险库" };
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "设置" }));
+    for (const value of ["", "0", "1.5", "1441"]) {
+      fireEvent.change(screen.getByRole("spinbutton", { name: "闲置时长" }), {
+        target: { value },
+      });
+      expect(screen.getByRole("button", { name: "保存设置" })).toBeDisabled();
+    }
+    expect(invoke).not.toHaveBeenCalledWith("mutate_vault", expect.anything());
+    fireEvent.change(screen.getByRole("spinbutton", { name: "闲置时长" }), {
+      target: { value: "15" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "无法写入保险库",
+    );
+    expect(useVault.getState().snapshot?.autoLock).toEqual({
+      enabled: true,
+      timeoutMinutes: 5,
+    });
+    expect(screen.getByRole("spinbutton", { name: "闲置时长" })).toHaveValue(
+      15,
+    );
+    expect(screen.getByRole("button", { name: "保存设置" })).toBeEnabled();
+  });
   it("无未保存编辑时允许原生关闭事件继续执行", async () => {
     useVault.getState().accept(fixture(), true);
     render(<App />);

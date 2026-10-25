@@ -95,6 +95,162 @@ fn idle_timeout_also_counts_wall_time_across_system_sleep() {
 }
 
 #[test]
+fn auto_lock_settings_are_local_encrypted_and_compatible_with_older_vaults() {
+    let (mut vault, _dir) = fixture();
+    let sid = vault.generation;
+    let mut state = vault.session.as_ref().unwrap().state.clone();
+    let mut legacy = serde_json::to_value(&state).unwrap();
+    legacy.as_object_mut().unwrap().remove("autoLock");
+    assert_eq!(
+        serde_json::from_value::<LocalState>(legacy)
+            .unwrap()
+            .auto_lock,
+        AutoLockSettings::default()
+    );
+    state.dirty = false;
+    vault.persist(state).unwrap();
+    let before = vault.snapshot().unwrap();
+    let settings = AutoLockSettings {
+        enabled: false,
+        timeout_minutes: 30,
+    };
+    let snapshot = vault
+        .mutate(
+            sid,
+            Action::SetAutoLock {
+                settings: settings.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(snapshot.auto_lock, settings);
+    assert!(!snapshot.dirty);
+    assert_eq!(snapshot.revision, before.revision + 1);
+    let session = vault.session.as_ref().unwrap();
+    let bytes = vault.storage.read(&vault.storage.path()).unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("autoLock"));
+    let restored: LocalState = crypto::open(&bytes, &session.keys, "local").unwrap();
+    assert_eq!(restored.auto_lock, settings);
+    assert_eq!(restored.document, session.state.document);
+    assert!(
+        serde_json::to_value(&restored.document)
+            .unwrap()
+            .get("autoLock")
+            .is_none()
+    );
+    let keys = session.keys.clone();
+    assert_eq!(vault.install(keys, restored).unwrap().auto_lock, settings);
+    let ciphertext = vault.storage.read(&vault.storage.path()).unwrap();
+    let revision = vault.snapshot().unwrap().revision;
+    for timeout_minutes in [0, 1441, u32::MAX] {
+        assert!(
+            vault
+                .mutate(
+                    vault.generation,
+                    Action::SetAutoLock {
+                        settings: AutoLockSettings {
+                            enabled: true,
+                            timeout_minutes
+                        }
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(vault.snapshot().unwrap().revision, revision);
+        assert_eq!(
+            vault.storage.read(&vault.storage.path()).unwrap(),
+            ciphertext
+        );
+    }
+}
+
+#[test]
+fn configured_idle_timeout_checks_both_clocks_and_can_be_disabled() {
+    let (mut vault, _dir) = fixture();
+    vault
+        .mutate(
+            vault.generation,
+            Action::SetAutoLock {
+                settings: AutoLockSettings {
+                    enabled: true,
+                    timeout_minutes: 2,
+                },
+            },
+        )
+        .unwrap();
+    vault.activity_wall = now().saturating_sub(61000);
+    assert!(!vault.idle_due());
+    vault.activity_wall = now().saturating_sub(121000);
+    assert!(vault.idle_due());
+    vault.touch();
+    vault.activity = Instant::now() - std::time::Duration::from_secs(121);
+    assert!(vault.idle_due());
+    vault
+        .mutate(
+            vault.generation,
+            Action::SetAutoLock {
+                settings: AutoLockSettings {
+                    enabled: false,
+                    timeout_minutes: 2,
+                },
+            },
+        )
+        .unwrap();
+    vault.activity = Instant::now() - std::time::Duration::from_secs(86400);
+    vault.activity_wall = now().saturating_sub(86400000);
+    assert!(!vault.idle_due());
+    vault.lock();
+    assert!(vault.session.is_none());
+}
+
+#[test]
+fn idle_lock_rechecks_latest_policy_and_cancels_the_expired_session() {
+    let (vault, dir) = fixture();
+    let shared = AppState::new(Storage::new(dir.path().into()).unwrap());
+    *shared.vault.lock().unwrap() = vault;
+    let sid;
+    {
+        let mut vault = shared.vault.lock().unwrap();
+        sid = vault.generation;
+        vault.activity_wall = now().saturating_sub(301000);
+        assert!(vault.idle_due());
+        vault
+            .mutate(
+                sid,
+                Action::SetAutoLock {
+                    settings: AutoLockSettings {
+                        enabled: false,
+                        timeout_minutes: 1,
+                    },
+                },
+            )
+            .unwrap();
+    }
+    assert!(!shared.lock_if_idle().unwrap());
+    let cancel = {
+        let mut vault = shared.vault.lock().unwrap();
+        vault
+            .mutate(
+                sid,
+                Action::SetAutoLock {
+                    settings: AutoLockSettings {
+                        enabled: true,
+                        timeout_minutes: 1,
+                    },
+                },
+            )
+            .unwrap();
+        vault.activity_wall = now().saturating_sub(61000);
+        vault.session.as_ref().unwrap().cancel.clone()
+    };
+    shared.schedule(2000);
+    assert!(shared.lock_if_idle().unwrap());
+    assert!(cancel.is_cancelled());
+    assert_eq!(shared.due.load(Ordering::SeqCst), 0);
+    assert!(shared.snapshot(sid).is_err());
+    assert!(!shared.lock_if_idle().unwrap());
+}
+
+#[test]
 fn batch_import_duplicate_policies_and_atomic_validation() {
     use super::import::{DuplicatePolicy, ImportRow};
     let (mut vault, _dir) = fixture();

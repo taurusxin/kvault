@@ -51,7 +51,7 @@ export function WindowBar() {
           className={`tracking-tight ${mac ? "text-[13px] font-medium" : "text-sm font-semibold"}`}
           data-tauri-drag-region
         >
-          kvault
+          KVault
         </span>
         {unlocked && !mac && (
           <PanelLeft className="ml-auto size-3.5 text-muted-foreground/60" />

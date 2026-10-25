@@ -30,7 +30,7 @@ export function Onboarding() {
     event.preventDefault();
     setError("");
     if (!desktop) {
-      setError("请使用桌面应用运行 kvault。浏览器预览无法访问加密保险库。");
+      setError("请使用桌面应用运行 KVault。浏览器预览无法访问加密保险库。");
       return;
     }
     if (
@@ -217,7 +217,7 @@ export function Onboarding() {
           {!exists && mode === "create" && (
             <>
               <p className="mt-4 text-[11px] leading-5 text-muted-foreground">
-                请妥善保管主密码。kvault
+                请妥善保管主密码。KVault
                 无法找回密码，也无法解密丢失密码的记录。
               </p>
               <div className="my-5 h-px bg-border" />

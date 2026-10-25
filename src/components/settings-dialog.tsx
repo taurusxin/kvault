@@ -13,6 +13,7 @@ import {
   Monitor,
   Moon,
   ShieldCheck,
+  Settings2,
   Sun,
   Upload,
 } from "lucide-react";
@@ -58,9 +59,14 @@ export function SettingsDialog({
   const [confirm, setConfirm] = useState("");
   const [replace, setReplace] = useState(false);
   const [error, setError] = useState("");
+  const [autoLockEnabled, setAutoLockEnabled] = useState(true);
+  const [autoLockMinutes, setAutoLockMinutes] = useState("5");
   useEffect(() => {
-    if (open) setConfig(snapshot?.config ?? emptyS3());
-    else {
+    if (open) {
+      setConfig(snapshot?.config ?? emptyS3());
+      setAutoLockEnabled(snapshot?.autoLock.enabled ?? true);
+      setAutoLockMinutes(String(snapshot?.autoLock.timeoutMinutes ?? 5));
+    } else {
       setConfig(emptyS3());
       setSecurity(null);
       setOldPassword("");
@@ -80,6 +86,16 @@ export function SettingsDialog({
     setReplace(false);
   }, [security]);
   if (!snapshot) return null;
+  const minutes = Number(autoLockMinutes);
+  const validMinutes =
+    Number.isInteger(minutes) && minutes >= 1 && minutes <= 1440;
+  const autoLock = {
+    enabled: autoLockEnabled,
+    timeoutMinutes: validMinutes ? minutes : snapshot.autoLock.timeoutMinutes,
+  };
+  const autoLockChanged =
+    autoLock.enabled !== snapshot.autoLock.enabled ||
+    autoLock.timeoutMinutes !== snapshot.autoLock.timeoutMinutes;
   async function run(task: () => Promise<unknown>, message?: string) {
     setWorking(true);
     setError("");
@@ -147,32 +163,58 @@ export function SettingsDialog({
           if (!working) onOpenChange(value);
         }}
       >
-        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-[500px]">
-          <DialogHeader>
+        <DialogContent className="flex h-[min(640px,85vh)] flex-col gap-0 overflow-hidden p-0 sm:max-w-[760px]">
+          <DialogHeader className="shrink-0 border-b px-6 py-5">
             <DialogTitle>保险库设置</DialogTitle>
-            <DialogDescription>
+            <DialogDescription className="text-xs">
               管理外观、云同步与保险库安全。
             </DialogDescription>
           </DialogHeader>
           <Tabs
             key={initialTab}
+            orientation="vertical"
             defaultValue={
               initialTab ?? (snapshot.recoveryPending ? "security" : "general")
             }
-            className="mt-1"
+            onValueChange={() => setError("")}
+            className="min-h-0 flex-1 gap-0"
           >
-            <TabsList className="w-full">
-              <TabsTrigger value="general" className="flex-1">
+            <TabsList
+              aria-label="设置分类"
+              className="w-44 shrink-0 items-stretch justify-start gap-1 rounded-none border-r bg-muted/20 px-3 py-4 group-data-vertical/tabs:h-full"
+            >
+              <TabsTrigger
+                value="general"
+                className="h-10 flex-none gap-2 px-3 text-xs"
+              >
+                <Settings2 />
                 通用
               </TabsTrigger>
-              <TabsTrigger value="cloud" className="flex-1">
+              <TabsTrigger
+                value="cloud"
+                className="h-10 flex-none gap-2 px-3 text-xs"
+              >
+                <Cloud />
                 云同步
               </TabsTrigger>
-              <TabsTrigger value="security" className="flex-1">
+              <TabsTrigger
+                value="security"
+                className="h-10 flex-none gap-2 px-3 text-xs"
+              >
+                <ShieldCheck />
                 安全与备份
               </TabsTrigger>
             </TabsList>
-            <TabsContent value="general" className="space-y-6 py-5">
+            <TabsContent
+              value="general"
+              className="m-0 min-h-0 min-w-0 space-y-6 overflow-y-auto p-6"
+            >
+              <div>
+                <h2 className="text-sm font-medium">通用</h2>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  外观、自动锁定与常用快捷键。
+                </p>
+              </div>
               <div>
                 <Label className="text-xs">外观</Label>
                 <div className="mt-3 grid grid-cols-3 gap-2">
@@ -195,16 +237,112 @@ export function SettingsDialog({
                   ))}
                 </div>
               </div>
-              <div className="rounded-xl border bg-muted/20 p-4">
-                <p className="flex items-center gap-2 text-xs font-medium">
-                  <LockKeyhole className="size-4" />
-                  自动锁定
-                </p>
-                <p className="mt-2 text-xs leading-6 text-muted-foreground">
-                  无操作 5
-                  分钟后锁定保险库，清除解锁内容。关闭应用后，下一次启动需要重新输入主密码。
-                </p>
-              </div>
+              <form
+                className="space-y-4 rounded-xl border p-4"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  if (!autoLockChanged || (autoLockEnabled && !validMinutes))
+                    return;
+                  void run(async () => {
+                    const saved = await mutate({
+                      type: "setAutoLock",
+                      settings: autoLock,
+                    });
+                    if (saved) toast.success("自动锁定设置已保存");
+                  });
+                }}
+              >
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <Label
+                      htmlFor="auto-lock-enabled"
+                      className="gap-2 text-xs font-medium"
+                    >
+                      <LockKeyhole className="size-4" />
+                      自动锁定
+                    </Label>
+                    <p
+                      id="auto-lock-description"
+                      className="mt-2 text-[11px] leading-5 text-muted-foreground"
+                    >
+                      闲置一段时间后锁定保险库，清除解锁内容。
+                    </p>
+                  </div>
+                  <Switch
+                    id="auto-lock-enabled"
+                    aria-describedby="auto-lock-description"
+                    checked={autoLockEnabled}
+                    disabled={working || snapshot.recoveryPending}
+                    onCheckedChange={setAutoLockEnabled}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="auto-lock-minutes" className="text-xs">
+                    闲置时长
+                  </Label>
+                  <div className="flex items-center gap-2">
+                    <Input
+                      id="auto-lock-minutes"
+                      type="number"
+                      min={1}
+                      max={1440}
+                      step={1}
+                      className="w-24 text-xs"
+                      value={autoLockMinutes}
+                      disabled={
+                        !autoLockEnabled || working || snapshot.recoveryPending
+                      }
+                      aria-invalid={autoLockEnabled && !validMinutes}
+                      aria-describedby="auto-lock-hint"
+                      onChange={(event) =>
+                        setAutoLockMinutes(event.target.value)
+                      }
+                    />
+                    <span className="text-xs text-muted-foreground">分钟</span>
+                  </div>
+                  <p
+                    id="auto-lock-hint"
+                    className="text-[11px] leading-5 text-muted-foreground"
+                  >
+                    {autoLockEnabled
+                      ? "支持 1–1440 分钟；自动锁定会丢弃未保存的编辑。"
+                      : autoLockChanged
+                        ? "已选择关闭自动锁定，保存后生效。仍可手动锁定保险库。"
+                        : "自动锁定已关闭。仍可手动锁定保险库。"}
+                  </p>
+                  {autoLockEnabled && !validMinutes && (
+                    <p role="alert" className="text-[11px] text-destructive">
+                      请输入 1–1440 之间的整数。
+                    </p>
+                  )}
+                </div>
+                <div className="flex items-center justify-between gap-3 border-t pt-3">
+                  <p className="text-[10px] leading-5 text-muted-foreground">
+                    仅在本机生效，关闭应用后仍需重新解锁。
+                  </p>
+                  <Button
+                    type="submit"
+                    size="sm"
+                    disabled={
+                      working ||
+                      snapshot.recoveryPending ||
+                      !autoLockChanged ||
+                      (autoLockEnabled && !validMinutes)
+                    }
+                  >
+                    {working && <LoaderCircle className="animate-spin" />}
+                    保存设置
+                  </Button>
+                </div>
+                {error && !security && (
+                  <p
+                    role="alert"
+                    className="text-xs leading-5 text-destructive"
+                  >
+                    {error}
+                  </p>
+                )}
+              </form>
               <div className="space-y-3 text-xs">
                 <p className="font-medium">快捷键</p>
                 <p className="flex justify-between text-muted-foreground">
@@ -232,12 +370,21 @@ export function SettingsDialog({
               <div className="flex items-center justify-between border-t pt-4 text-[10px] text-muted-foreground">
                 <span className="flex items-center gap-1.5">
                   <ShieldCheck className="size-3.5" />
-                  kvault 0.1.0
+                  KVault 0.1.0
                 </span>
                 <span>本地优先 · 端到端加密</span>
               </div>
             </TabsContent>
-            <TabsContent value="cloud" className="space-y-5 py-5">
+            <TabsContent
+              value="cloud"
+              className="m-0 min-h-0 min-w-0 space-y-5 overflow-y-auto p-6"
+            >
+              <div>
+                <h2 className="text-sm font-medium">云同步</h2>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  配置一个 S3 或 WebDAV 同步目标。
+                </p>
+              </div>
               <SyncForm
                 config={config}
                 saved={Boolean(
@@ -320,7 +467,16 @@ export function SettingsDialog({
                 </div>
               )}
             </TabsContent>
-            <TabsContent value="security" className="space-y-5 py-5">
+            <TabsContent
+              value="security"
+              className="m-0 min-h-0 min-w-0 space-y-5 overflow-y-auto p-6"
+            >
+              <div>
+                <h2 className="text-sm font-medium">安全与备份</h2>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  管理主密码、密码迁移和加密备份。
+                </p>
+              </div>
               {snapshot.recoveryPending && (
                 <div className="rounded-xl border border-amber-500/25 bg-amber-500/8 p-4">
                   <p className="text-xs font-medium">密码变更待恢复</p>

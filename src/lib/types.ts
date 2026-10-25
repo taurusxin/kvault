@@ -61,6 +61,11 @@ export interface Snapshot {
   lastSyncedAt: number | null;
   dirty: boolean;
   recoveryPending: boolean;
+  autoLock: AutoLockSettings;
+}
+export interface AutoLockSettings {
+  enabled: boolean;
+  timeoutMinutes: number;
 }
 export interface Bootstrap {
   exists: boolean;
@@ -80,6 +85,7 @@ export interface Draft {
   notes: string;
 }
 export type Action =
+  | { type: "setAutoLock"; settings: AutoLockSettings }
   | { type: "createTable"; name: string }
   | { type: "renameTable"; id: string; name: string }
   | { type: "deleteTable"; id: string }

@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "kvault",
+  "productName": "KVault",
   "version": "0.1.0",
   "identifier": "com.taurusxin.kvault",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "kvault",
+        "title": "KVault",
         "width": 1200,
         "height": 800,
         "minWidth": 960,

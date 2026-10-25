@@ -49,7 +49,7 @@ pub fn run() {
             commands::import_backup
         ])
         .build(tauri::generate_context!())
-        .expect("failed to initialize kvault")
+        .expect("failed to initialize KVault")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event
                 && let Some(state) = app.try_state::<vault::Shared>()
