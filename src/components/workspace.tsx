@@ -1003,7 +1003,7 @@ export function Workspace() {
                 <ScrollArea className="min-h-0 flex-1">
                   <fieldset
                     disabled={readOnly || ordering || store.busy}
-                    className="space-y-6 p-5"
+                    className="min-w-0 space-y-6 p-5"
                   >
                     <div className="space-y-2">
                       <Label
