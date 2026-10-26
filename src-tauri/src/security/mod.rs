@@ -7,6 +7,9 @@ use zeroize::Zeroizing;
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "windows", test))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod prf;
 #[cfg(target_os = "windows")]
 mod windows;
 

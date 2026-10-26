@@ -67,17 +67,21 @@ login Keychain 只保存二进制封装：Secure Enclave 的不透明私钥表�
 
 ### Windows
 
-通过 Microsoft Passport Key Storage Provider 创建每个保险库独立、不可导出的 RSA-2048 密钥，用 RSA-OAEP/SHA256 封装 DEK；账户引用作为 OAEP label。Credential Manager 只保存 RSA 密文。
+通过原生 Win32 WebAuthn PRF（hmac-secret）和 AES-256-GCM 封装 DEK。不保留 Passport RSA、DPAPI 或旧版 Windows 的兼容后端，不引入第三方生物识别插件。系统解锁仍为默认关闭的本机选项，主密码始终可用。
 
-私钥启用 `NgcCacheType=AUTH_MANDATORY`，解密前设置 `PinCacheIsGestureRequired`，并检查认证策略、密钥长度、导出策略和禁止导入标记。`NCryptDecrypt` 成功后才得到 DEK，使用 Hello PIN、指纹或面容由 Windows 决定。界面窗口句柄传入 CNG，用于原生对话框归属。提供程序不支持必要策略、未配置 Hello 或用户取消时明确失败，不退回到仅 DPAPI 或仅验证弹窗的方案。
+能力检查分两阶段：启动和启用前先要求 WebAuthn API ≥ 8 且本机用户验证认证器可用；首次启用再注册驻留平台凭据，要求 PRF、`credProtect=userVerificationRequired` 和注册时 PRF 求值。返回值必须包含 32 字节 PRF 输出；验证 RP ID 哈希及 UP/UV 标志，拒绝可备份/已备份凭据，只接受内部传输的本机认证器。不能仅凭 Hello 弹窗成功就认为 PRF 可用。
 
-需要在真实 Windows 设备验收提供程序、RSA-OAEP 支持和每次验证行为。交叉编译检查不等于实际 Hello 验证。
+稳定 RP ID 为 `kvault.taurusxin.com`，对应 client-data origin 只用于本地 WebAuthn 调用，不发起网络请求。每次注册使用随机 32 字节用户句柄，每次封装使用随机 32 字节 PRF 输入和随机 12 字节 nonce。PRF 输出直接作为 AES-256-GCM 密钥，不保存；AAD 认证协议版本、算法域、RP ID、账户引用、凭据 ID、PRF 输入和 nonce。账户引用包含本机目录哈希和保险库文件头指纹，绑定保险库 UUID 与密钥代次。
 
-Windows 原生错误显示失败阶段、属性名称和十六进制 `SECURITY_STATUS`，不包含密码、数据密钥、密文或凭据。认证缓存属性兼容旧名 `NgcCacheTypeProperty`，仅在提供程序明确不支持当前属性名时尝试，仍要求 `AUTH_MANDATORY` 和每次私钥操作验证。调查与复测步骤见 [Windows Hello 调查](windows-hello-investigation.md)。
+本机凭据条目为 `webauthn-prf:<account>`。二进制封装以 `KVPRF\x01\0\0` 开头，随后为 2 字节小端凭据 ID 长度、凭据 ID（1–2048 字节）、32 字节 PRF 输入、12 字节 nonce、48 字节 DEK 密文及认证标签；最大 2150 字节。严格校验版本与长度，不解析旧 RSA 条目。
+
+启用时先通过一次独立 assertion 重现 PRF 并实际解密验证，成功写入 Credential Manager 后，命令层才保存启用标记。已有当前格式凭据通过新的用户验证复用，避免重新注册提前替换已生效授权。取消或保存失败保留已有封装；失败的新注册会尝试删除。每次解锁都发起新的 assertion，只允许指定的凭据 ID，并再次要求 UV、设备绑定和正确 PRF。原生输出与 Rust PRF/DEK 缓冲区在使用后清理，前端不接收密钥。
+
+Windows 错误显示具体阶段和十六进制 `HRESULT`，取消独立返回；能力不足时明确提示更新 Windows 或使用主密码。旧 Windows 系统授权需要使用主密码重新启用，不迁移旧授权。交叉类型检查和协议测试不等于 Windows Hello 实机验收，详见 [Windows Hello 调查与复测](windows-hello-investigation.md)。
 
 ### 授权清理与并发
 
-关闭系统解锁会删除本机封装与授权标记，Windows 同时删除相应 CNG 私钥。密码变更、更换保险库或迁移到新密钥代次时清除旧授权，需重新启用。macOS 删除的是本机封装；不要将系统凭据条目复制为额外备份。
+关闭系统解锁会删除本机封装与授权标记，Windows 同时删除相应 WebAuthn 平台凭据。密码变更、更换保险库或迁移到新密钥代次时清除旧授权，需重新启用。macOS 删除的是本机封装；不要将系统凭据条目复制为额外备份。
 
 原生验证不持有保险库互斥锁。返回结果提交前校验会话代次及文件头；验证期间发生锁定或更换保险库时拒绝迟到结果，清理尚未提交的新授权。恢复日志或换密暂存文件存在时，使用主密码处理恢复。
 
@@ -93,4 +97,4 @@ Windows 原生错误显示失败阶段、属性名称和十六进制 `SECURITY_S
 
 本次 macOS 保留原生适配的具体约束是 ad-hoc 发布兼容性：该插件的 macOS 存储走 Data Protection Keychain，而本机同路径探针返回 `errSecMissingEntitlement (-34018)`。当前实现使用 Secure Enclave 操作保护密钥，login Keychain 只存封装，已经通过实际验证。该取舍不代表自定义代码天然比插件安全；如后续采用插件，应先核对指定发布版本、签名条件和平台要求，并从 Rust 调用安全存取接口，避免将 DEK 暴露给前端。`SecretStore` 隔离了平台差异，替换适配无需改变业务加密格式。
 
-参考：[Apple Secure Enclave 私钥 API](https://developer.apple.com/documentation/cryptokit/secureenclave/p256/keyagreement/privatekey)、[Microsoft CNG](https://learn.microsoft.com/en-us/windows/win32/seccng/cng-key-storage-functions)、[keyring 平台适配](https://docs.rs/keyring/3.6.3/keyring/)。
+参考：[Apple Secure Enclave 私钥 API](https://developer.apple.com/documentation/cryptokit/secureenclave/p256/keyagreement/privatekey)、[Microsoft WebAuthn](https://learn.microsoft.com/en-us/windows/win32/api/webauthn/)、[keyring 平台适配](https://docs.rs/keyring/3.6.3/keyring/)。

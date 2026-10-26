@@ -44,6 +44,8 @@ keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6.3", features = ["windows-native"] }
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WindowsWebServices"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
@@ -54,6 +56,7 @@ security-framework-sys = { version = "2.17", features = ["OSX_10_15"] }
 [dev-dependencies]
 tempfile = "3"
 axum = "0.8"
+aes-gcm = { version = "0.10", features = ["zeroize"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

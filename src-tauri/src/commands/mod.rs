@@ -117,8 +117,14 @@ pub(crate) async fn configure_system_unlock(
     let task_shared = shared.clone();
     let snapshot = blocking(move || {
         if enabled {
-            if !storage.secrets.availability().available {
-                return Err(crate::security::unavailable());
+            let capability = storage.secrets.availability();
+            if !capability.available {
+                return Err(AppError::new(
+                    "system_auth_unavailable",
+                    capability
+                        .reason
+                        .unwrap_or_else(|| "系统验证不可用，请使用主密码".into()),
+                ));
             }
             let verified = Keys::derive(&password, keys.header.clone())?;
             let check = crypto::seal(&true, &keys, "password-check")?;

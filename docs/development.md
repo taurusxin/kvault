@@ -110,6 +110,6 @@ KVAULT_DATA_DIR="$PWD/.qa-vault" pnpm tauri dev
 
 详细规则见 [存储与系统解锁](storage-security.md)。自动化测试中的凭据库为内存替身，不会访问宿主系统 Keychain 或 Hello。原生验证须在独立数据目录进行：确认系统解锁默认关闭；启用时确认主密码、实际完成系统验证；锁定后分别测试系统解锁与主密码；取消原生提示后验证主密码仍可用；关闭开关及换密后确认旧授权不能继续解锁。
 
-macOS 的 ad-hoc 构建不增加受限钥匙串授权组。Secure Enclave 私钥操作执行用户验证，login Keychain 保存不透明硬件密钥表示及密文；读取该条目本身不能解锁保险库。打包后需验证首次钥匙串提示、重启和更新构建后的行为。Windows 需确认设备支持 Passport 提供程序的认证强制策略与 RSA-OAEP；不支持时明确禁用，不使用不带 Hello 验证的回退。
+macOS 的 ad-hoc 构建不增加受限钥匙串授权组。Secure Enclave 私钥操作执行用户验证，login Keychain 保存不透明硬件密钥表示及密文；读取该条目本身不能解锁保险库。打包后需验证首次钥匙串提示、重启和更新构建后的行为。Windows 系统解锁要求 WebAuthn API ≥ 8、本机用户验证认证器及真实 PRF 支持；不提供旧系统、Passport RSA 或 DPAPI 兼容后端。启用时会进行注册和独立解封验证，参见 [Windows 复测步骤](windows-hello-investigation.md)。
 
 调试数据目录也参与凭据账户命名，切勿将真实密码或实际云配置用于演示目录。新版本不读取 v1 文件；如旧 `.qa-vault` 已存在，应新建一个空目录再调试。

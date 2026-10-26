@@ -1,115 +1,58 @@
-//! Windows Hello uses a non-exportable Passport CNG RSA key. Only NCryptDecrypt
-//! can release the DEK; Credential Manager contains the RSA ciphertext only.
-//! No UserConsentVerifier + DPAPI-only fallback is provided.
-use super::{SecretStore, SystemUnlock, unavailable};
+//! Windows Hello unlock via native WebAuthn PRF and AES-256-GCM.
+//! Requires API v8; there is no Passport/CNG, DPAPI or verification-only fallback.
+use super::{
+    SecretStore, SystemUnlock,
+    prf::{self, AuthResult, Authenticator, Registration},
+};
 use crate::error::{AppError, Result};
-use std::{ffi::c_void, ptr};
-use zeroize::Zeroizing;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use rand::{RngCore, rngs::OsRng};
+use std::{mem::size_of, ptr};
+use windows_sys::{
+    Win32::{Foundation::HWND, Networking::WindowsWebServices::*},
+    core::{BOOL, PCWSTR, w},
+};
+use zeroize::{Zeroize, Zeroizing};
 
-#[link(name = "ncrypt")]
-unsafe extern "system" {
-    fn NCryptOpenStorageProvider(out: *mut usize, name: *const u16, flags: u32) -> i32;
-    fn NCryptCreatePersistedKey(
-        provider: usize,
-        out: *mut usize,
-        algorithm: *const u16,
-        name: *const u16,
-        legacy: u32,
-        flags: u32,
-    ) -> i32;
-    fn NCryptOpenKey(
-        provider: usize,
-        out: *mut usize,
-        name: *const u16,
-        legacy: u32,
-        flags: u32,
-    ) -> i32;
-    fn NCryptSetProperty(
-        key: usize,
-        name: *const u16,
-        value: *const u8,
-        size: u32,
-        flags: u32,
-    ) -> i32;
-    fn NCryptGetProperty(
-        key: usize,
-        name: *const u16,
-        value: *mut u8,
-        size: u32,
-        written: *mut u32,
-        flags: u32,
-    ) -> i32;
-    fn NCryptFinalizeKey(key: usize, flags: u32) -> i32;
-    fn NCryptEncrypt(
-        key: usize,
-        input: *const u8,
-        size: u32,
-        padding: *const Oaep,
-        output: *mut u8,
-        capacity: u32,
-        written: *mut u32,
-        flags: u32,
-    ) -> i32;
-    fn NCryptDecrypt(
-        key: usize,
-        input: *const u8,
-        size: u32,
-        padding: *const Oaep,
-        output: *mut u8,
-        capacity: u32,
-        written: *mut u32,
-        flags: u32,
-    ) -> i32;
-    fn NCryptDeleteKey(key: usize, flags: u32) -> i32;
-    fn NCryptFreeObject(handle: usize) -> i32;
-}
-#[link(name = "advapi32")]
-unsafe extern "system" {
-    fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
-    fn GetTokenInformation(
-        token: *mut c_void,
-        class: u32,
-        data: *mut c_void,
-        length: u32,
-        required: *mut u32,
-    ) -> i32;
-    fn ConvertSidToStringSidW(sid: *const c_void, text: *mut *mut u16) -> i32;
-}
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn CloseHandle(handle: *mut c_void) -> i32;
-    fn LocalFree(memory: *mut c_void) -> *mut c_void;
-}
-
+// windows-sys 0.61 models the v7 make-options and v6 attestation prefixes.
+// Append only the fields defined by Microsoft's webauthn.h for API v8.
 #[repr(C)]
-struct Oaep {
-    algorithm: *const u16,
-    label: *const u8,
-    label_len: u32,
+#[derive(Default)]
+struct MakeOptionsV8 {
+    base: WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS,
+    prf_eval: *mut WEBAUTHN_HMAC_SECRET_SALT,
+    hint_count: u32,
+    hints: *mut PCWSTR,
+    third_party_payment: BOOL,
 }
-struct Handle(usize);
-impl Drop for Handle {
-    fn drop(&mut self) {
-        if self.0 != 0 {
-            unsafe {
-                NCryptFreeObject(self.0);
-            }
-        }
-    }
+#[repr(C)]
+struct AttestationV7 {
+    base: WEBAUTHN_CREDENTIAL_ATTESTATION,
+    prf: *mut WEBAUTHN_HMAC_SECRET_SALT,
+    third_party_payment: BOOL,
 }
-fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(Some(0)).collect()
-}
+
+// Guard against accidentally appending to a changed generated SDK prefix.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::offset_of!(MakeOptionsV8, prf_eval) == 128);
+    assert!(size_of::<MakeOptionsV8>() == 160);
+    assert!(std::mem::offset_of!(AttestationV7, prf) == 144);
+    assert!(size_of::<AttestationV7>() == 160);
+};
+
 fn check(status: i32, stage: &str) -> Result<()> {
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(status_error(status, stage))
+    if status >= 0 {
+        return Ok(());
     }
-}
-fn status_error(status: i32, stage: &str) -> AppError {
-    if matches!(status as u32, 0x80090036 | 0x800704c7) {
-        AppError::new("auth_cancelled", "已取消 Windows Hello，可使用主密码解锁")
+    if matches!(status as u32, 0x80090029 | 0x80070032 | 0x80004001) {
+        return Err(prf::unsupported(format!(
+            "本机认证器不支持所需 PRF 能力：{stage}（0x{:08X}），请更新 Windows 或使用主密码。",
+            status as u32
+        )));
+    }
+    Err(if matches!(status as u32, 0x80090036 | 0x800704c7) {
+        AppError::new("auth_cancelled", "已取消 Windows Hello，可继续使用主密码")
     } else {
         AppError::new(
             "system_auth",
@@ -118,174 +61,321 @@ fn status_error(status: i32, stage: &str) -> AppError {
                 status as u32
             ),
         )
+    })
+}
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(Some(0)).collect()
+}
+fn copy_bytes(data: *const u8, size: u32, max: usize) -> Result<Vec<u8>> {
+    if data.is_null() || size == 0 || size as usize > max {
+        return Err(prf::unsupported("WebAuthn 返回的数据无效，未启用系统解锁"));
+    }
+    // The pointer belongs to a successful WebAuthn result and is alive until
+    // its guard is dropped; every copy is bounded before making a slice.
+    Ok(unsafe { std::slice::from_raw_parts(data, size as usize) }.to_vec())
+}
+unsafe fn copy_prf(data: *mut WEBAUTHN_HMAC_SECRET_SALT) -> Option<Zeroizing<[u8; 32]>> {
+    if data.is_null() {
+        return None;
+    }
+    let data = unsafe { &*data };
+    if data.cbFirst != 32 || data.pbFirst.is_null() {
+        return None;
+    }
+    let mut key = Zeroizing::new([0; 32]);
+    key.copy_from_slice(unsafe { std::slice::from_raw_parts(data.pbFirst, 32) });
+    Some(key)
+}
+unsafe fn wipe_prf(data: *mut WEBAUTHN_HMAC_SECRET_SALT) {
+    if !data.is_null() {
+        let data = unsafe { &*data };
+        // We request a single 32-byte PRF output. Wipe native copies before
+        // WebAuthNFree*; don't trust unexpected lengths for writes.
+        if data.cbFirst == 32 && !data.pbFirst.is_null() {
+            unsafe { std::slice::from_raw_parts_mut(data.pbFirst, 32) }.zeroize();
+        }
     }
 }
-fn provider() -> Result<Handle> {
-    let mut handle = 0;
-    check(
-        unsafe {
-            NCryptOpenStorageProvider(
-                &mut handle,
-                wide("Microsoft Passport Key Storage Provider").as_ptr(),
-                0,
-            )
-        },
-        "打开 Passport 密钥提供程序",
-    )?;
-    Ok(Handle(handle))
-}
-fn current_sid() -> Result<String> {
-    unsafe {
-        let mut token = ptr::null_mut();
-        if OpenProcessToken(-1isize as *mut c_void, 8, &mut token) == 0 {
-            return Err(unavailable());
+struct Attestation(*mut WEBAUTHN_CREDENTIAL_ATTESTATION);
+impl Drop for Attestation {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                if (*self.0).dwVersion >= 7 {
+                    wipe_prf((*self.0.cast::<AttestationV7>()).prf);
+                }
+                WebAuthNFreeCredentialAttestation(self.0);
+            }
         }
+    }
+}
+struct Assertion(*mut WEBAUTHN_ASSERTION);
+impl Drop for Assertion {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                if (*self.0).dwVersion >= 3 {
+                    wipe_prf((*self.0).pHmacSecret);
+                }
+                WebAuthNFreeAssertion(self.0);
+            }
+        }
+    }
+}
+fn client_data(kind: &str) -> Vec<u8> {
+    let mut challenge = [0; 32];
+    OsRng.fill_bytes(&mut challenge);
+    format!(r#"{{"type":"webauthn.{kind}","challenge":"{}","origin":"https://{}","crossOrigin":false}}"#,
+        URL_SAFE_NO_PAD.encode(challenge), prf::RP_ID).into_bytes()
+}
+fn client(bytes: &mut [u8]) -> WEBAUTHN_CLIENT_DATA {
+    WEBAUTHN_CLIENT_DATA {
+        dwVersion: 1,
+        cbClientDataJSON: bytes.len() as u32,
+        pbClientDataJSON: bytes.as_mut_ptr(),
+        pwszHashAlgId: w!("SHA-256"),
+    }
+}
+struct Native {
+    window: isize,
+}
+impl Native {
+    fn hwnd(&self) -> Result<HWND> {
+        if self.window == 0 {
+            return Err(AppError::invalid("Windows Hello 需要有效的应用窗口"));
+        }
+        Ok(self.window as HWND)
+    }
+}
+impl Authenticator for Native {
+    fn capabilities(&self) -> Result<(u32, bool)> {
+        let api = unsafe { WebAuthNGetApiVersionNumber() };
+        if api < prf::MIN_API {
+            return Ok((api, false));
+        }
+        let mut available = 0;
+        check(
+            unsafe { WebAuthNIsUserVerifyingPlatformAuthenticatorAvailable(&mut available) },
+            "检查本机认证器能力",
+        )?;
+        Ok((api, available != 0))
+    }
+    fn register(&self, _account: &str, salt: &[u8; 32]) -> Result<Registration> {
+        let rp_id = wide(prf::RP_ID);
+        let rp = WEBAUTHN_RP_ENTITY_INFORMATION {
+            dwVersion: 1,
+            pwszId: rp_id.as_ptr(),
+            pwszName: w!("KVault"),
+            pwszIcon: ptr::null(),
+        };
+        // A fresh handle avoids replacing a resident credential left by an
+        // interrupted enrollment. Account/vault binding is authenticated by AEAD.
+        let mut user_id = [0; 32];
+        OsRng.fill_bytes(&mut user_id);
+        let user = WEBAUTHN_USER_ENTITY_INFORMATION {
+            dwVersion: 1,
+            cbId: 32,
+            pbId: user_id.as_mut_ptr(),
+            pwszName: w!("KVault 本机保险库"),
+            pwszIcon: ptr::null(),
+            pwszDisplayName: w!("KVault 系统解锁"),
+        };
+        let mut parameters = [
+            WEBAUTHN_COSE_CREDENTIAL_PARAMETER {
+                dwVersion: 1,
+                pwszCredentialType: WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY,
+                lAlg: -7,
+            },
+            WEBAUTHN_COSE_CREDENTIAL_PARAMETER {
+                dwVersion: 1,
+                pwszCredentialType: WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY,
+                lAlg: -257,
+            },
+        ];
+        let parameters = WEBAUTHN_COSE_CREDENTIAL_PARAMETERS {
+            cCredentialParameters: parameters.len() as u32,
+            pCredentialParameters: parameters.as_mut_ptr(),
+        };
+        let mut raw_salt = *salt;
+        let mut eval = WEBAUTHN_HMAC_SECRET_SALT {
+            cbFirst: 32,
+            pbFirst: raw_salt.as_mut_ptr(),
+            cbSecond: 0,
+            pbSecond: ptr::null_mut(),
+        };
+        let mut protection = WEBAUTHN_CRED_PROTECT_EXTENSION_IN {
+            dwCredProtect: 3,
+            bRequireCredProtect: 1,
+        };
+        let mut extension = WEBAUTHN_EXTENSION {
+            pwszExtensionIdentifier: w!("credProtect"),
+            cbExtension: size_of::<WEBAUTHN_CRED_PROTECT_EXTENSION_IN>() as u32,
+            pvExtension: (&mut protection as *mut WEBAUTHN_CRED_PROTECT_EXTENSION_IN).cast(),
+        };
+        let options = MakeOptionsV8 {
+            base: WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS {
+                dwVersion: 8,
+                dwTimeoutMilliseconds: 60_000,
+                Extensions: WEBAUTHN_EXTENSIONS {
+                    cExtensions: 1,
+                    pExtensions: &mut extension,
+                },
+                dwAuthenticatorAttachment: WEBAUTHN_AUTHENTICATOR_ATTACHMENT_PLATFORM,
+                bRequireResidentKey: 1,
+                bPreferResidentKey: 1,
+                dwUserVerificationRequirement: WEBAUTHN_USER_VERIFICATION_REQUIREMENT_REQUIRED,
+                dwAttestationConveyancePreference: WEBAUTHN_ATTESTATION_CONVEYANCE_PREFERENCE_NONE,
+                bEnablePrf: 1,
+                ..Default::default()
+            },
+            prf_eval: &mut eval,
+            ..Default::default()
+        };
+        let mut bytes = client_data("create");
+        let data = client(&mut bytes);
+        let mut output = Attestation(ptr::null_mut());
+        check(
+            unsafe {
+                WebAuthNAuthenticatorMakeCredential(
+                    self.hwnd()?,
+                    &rp,
+                    &user,
+                    &parameters,
+                    &data,
+                    (&options as *const MakeOptionsV8).cast(),
+                    &mut output.0,
+                )
+            },
+            "注册本机 PRF 凭据",
+        )?;
+        if output.0.is_null() {
+            return Err(prf::unsupported("WebAuthn 未返回注册结果"));
+        }
+        let base = unsafe { &*output.0 };
+        let credential = copy_bytes(
+            base.pbCredentialId,
+            base.cbCredentialId,
+            prf::MAX_CREDENTIAL,
+        )?;
         let result = (|| {
-            let mut size = 0;
-            GetTokenInformation(token, 1, ptr::null_mut(), 0, &mut size);
-            if size == 0 || size > 65536 {
-                return Err(unavailable());
+            if base.dwVersion < 7 {
+                return Err(prf::unsupported("系统未返回注册时 PRF，未启用系统解锁"));
             }
-            // TOKEN_USER begins with a SID pointer; u64 storage supplies alignment.
-            let mut data = vec![0u64; (size as usize).div_ceil(8)];
-            if GetTokenInformation(token, 1, data.as_mut_ptr().cast(), size, &mut size) == 0 {
-                return Err(unavailable());
-            }
-            let sid = *(data.as_ptr() as *const *const c_void);
-            let mut text = ptr::null_mut();
-            if ConvertSidToStringSidW(sid, &mut text) == 0 {
-                return Err(unavailable());
-            }
-            let mut length = 0;
-            while *text.add(length) != 0 && length < 256 {
-                length += 1;
-            }
-            let result = String::from_utf16(std::slice::from_raw_parts(text, length))
-                .map_err(|_| unavailable());
-            LocalFree(text.cast());
-            result
+            Ok(Registration {
+                result: AuthResult {
+                    credential: credential.clone(),
+                    authenticator_data: copy_bytes(
+                        base.pbAuthenticatorData,
+                        base.cbAuthenticatorData,
+                        65536,
+                    )?,
+                    prf: unsafe { copy_prf((*output.0.cast::<AttestationV7>()).prf) },
+                },
+                prf_enabled: base.bPrfEnabled != 0,
+                resident: base.bResidentKey != 0,
+                internal: base.dwUsedTransport == WEBAUTHN_CTAP_TRANSPORT_INTERNAL,
+            })
         })();
-        CloseHandle(token);
+        if result.is_err() {
+            let _ = self.delete(&credential);
+        }
         result
     }
-}
-fn key_name(account: &str) -> Result<Vec<u16>> {
-    Ok(wide(&format!("{}//KVault/v2/{account}", current_sid()?)))
-}
-fn property(key: &Handle, name: &str, value: &[u8]) -> Result<()> {
-    check(set_property(key, name, value), &format!("设置 {name}"))
-}
-fn set_property(key: &Handle, name: &str, value: &[u8]) -> i32 {
-    unsafe {
-        NCryptSetProperty(
-            key.0,
-            wide(name).as_ptr(),
-            value.as_ptr(),
-            value.len() as u32,
-            0,
-        )
-    }
-}
-fn integer(key: &Handle, name: &str) -> Result<u32> {
-    integer_status(key, name).map_err(|status| status_error(status, &format!("读取 {name}")))
-}
-fn integer_status(key: &Handle, name: &str) -> std::result::Result<u32, i32> {
-    let mut value = 0u32;
-    let mut written = 0;
-    let status = unsafe {
-        NCryptGetProperty(
-            key.0,
-            wide(name).as_ptr(),
-            (&mut value as *mut u32).cast(),
-            4,
-            &mut written,
-            0,
-        )
-    };
-    if status != 0 {
-        return Err(status);
-    }
-    if written != 4 {
-        return Err(0x80090004u32 as i32); // NTE_BAD_LEN
-    }
-    Ok(value)
-}
-fn unsupported_property(status: i32) -> bool {
-    matches!(status as u32, 0x80090029 | 0x80090027 | 0x80070032)
-}
-fn set_cache_policy(key: &Handle) -> Result<()> {
-    let status = set_property(key, "NgcCacheType", &1u32.to_le_bytes());
-    if unsupported_property(status) {
-        // Older Passport providers expose the same policy under its old name.
-        // Never fall back to an authentication-optional key or software store.
-        property(key, "NgcCacheTypeProperty", &1u32.to_le_bytes())
-    } else {
-        check(status, "设置 NgcCacheType")
-    }
-}
-fn cache_policy(key: &Handle) -> Result<u32> {
-    match integer_status(key, "NgcCacheType") {
-        Err(status) if unsupported_property(status) => integer(key, "NgcCacheTypeProperty"),
-        Err(status) => Err(status_error(status, "读取 NgcCacheType")),
-        Ok(value) => Ok(value),
-    }
-}
-fn verify_policy(key: &Handle) -> Result<()> {
-    // Reject imported/exportable or authentication-optional replacement keys.
-    for (property, actual, expected) in [
-        ("NgcCacheType", cache_policy(key)?, 1),
-        (
-            "Key Usage（允许解密、禁止导入）",
-            integer(key, "Key Usage")? & 9,
-            1,
-        ),
-        ("Export Policy", integer(key, "Export Policy")?, 0),
-        ("Length", integer(key, "Length")?, 2048),
-    ] {
-        if actual != expected {
-            return Err(AppError::new(
-                "system_auth",
-                format!(
-                    "Windows Hello 密钥策略校验失败：{property}（实际 {actual}，要求 {expected}），请使用主密码并重新启用。"
-                ),
-            ));
+    fn evaluate(&self, credential: &[u8], salt: &[u8; 32]) -> Result<AuthResult> {
+        let mut id = credential.to_vec();
+        let mut allowed = WEBAUTHN_CREDENTIAL_EX {
+            dwVersion: 1,
+            cbId: id.len() as u32,
+            pbId: id.as_mut_ptr(),
+            pwszCredentialType: WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY,
+            dwTransports: WEBAUTHN_CTAP_TRANSPORT_INTERNAL,
+        };
+        let mut allowed_ptr = &mut allowed as *mut WEBAUTHN_CREDENTIAL_EX;
+        let mut list = WEBAUTHN_CREDENTIAL_LIST {
+            cCredentials: 1,
+            ppCredentials: &mut allowed_ptr,
+        };
+        let mut raw_salt = *salt;
+        let mut eval = WEBAUTHN_HMAC_SECRET_SALT {
+            cbFirst: 32,
+            pbFirst: raw_salt.as_mut_ptr(),
+            cbSecond: 0,
+            pbSecond: ptr::null_mut(),
+        };
+        let mut salts = WEBAUTHN_HMAC_SECRET_SALT_VALUES {
+            pGlobalHmacSalt: &mut eval,
+            cCredWithHmacSecretSaltList: 0,
+            pCredWithHmacSecretSaltList: ptr::null_mut(),
+        };
+        let options = WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS {
+            dwVersion: WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_6,
+            dwTimeoutMilliseconds: 60_000,
+            dwAuthenticatorAttachment: WEBAUTHN_AUTHENTICATOR_ATTACHMENT_PLATFORM,
+            dwUserVerificationRequirement: WEBAUTHN_USER_VERIFICATION_REQUIREMENT_REQUIRED,
+            pAllowCredentialList: &mut list,
+            pHmacSecretSaltValues: &mut salts,
+            ..Default::default()
+        };
+        let mut bytes = client_data("get");
+        let data = client(&mut bytes);
+        let rp_id = wide(prf::RP_ID);
+        let mut output = Assertion(ptr::null_mut());
+        check(
+            unsafe {
+                WebAuthNAuthenticatorGetAssertion(
+                    self.hwnd()?,
+                    rp_id.as_ptr(),
+                    &data,
+                    &options,
+                    &mut output.0,
+                )
+            },
+            "读取 PRF / Hello 验证",
+        )?;
+        if output.0.is_null() || unsafe { (*output.0).dwVersion } < 3 {
+            return Err(prf::unsupported("系统未返回 PRF 验证结果，请使用主密码"));
         }
+        let value = unsafe { &*output.0 };
+        Ok(AuthResult {
+            credential: copy_bytes(
+                value.Credential.pbId,
+                value.Credential.cbId,
+                prf::MAX_CREDENTIAL,
+            )?,
+            authenticator_data: copy_bytes(
+                value.pbAuthenticatorData,
+                value.cbAuthenticatorData,
+                65536,
+            )?,
+            prf: unsafe { copy_prf(value.pHmacSecret) },
+        })
     }
-    Ok(())
-}
-fn ui_context(key: &Handle, window: isize) -> Result<()> {
-    if window != 0 {
-        property(key, "HWND Handle", &window.to_ne_bytes())?;
+    fn delete(&self, credential: &[u8]) -> Result<()> {
+        if credential.is_empty() || credential.len() > prf::MAX_CREDENTIAL {
+            return Err(AppError::invalid("无效的 PRF 凭据 ID"));
+        }
+        let status = unsafe {
+            WebAuthNDeletePlatformCredential(credential.len() as u32, credential.as_ptr())
+        };
+        if matches!(status as u32, 0x80090011 | 0x80070490) {
+            return Ok(());
+        }
+        check(status, "撤销本机 PRF 凭据")
     }
-    let message = wide("解锁 KVault 保险库");
-    let bytes: Vec<u8> = message.iter().flat_map(|c| c.to_le_bytes()).collect();
-    property(key, "Use Context", &bytes)
 }
-fn open_key(account: &str) -> Result<(Handle, Handle)> {
-    let provider = provider()?;
-    let mut key = 0;
-    check(
-        unsafe { NCryptOpenKey(provider.0, &mut key, key_name(account)?.as_ptr(), 0, 0) },
-        "打开已创建的密钥",
-    )?;
-    let key = Handle(key);
-    verify_policy(&key)?;
-    Ok((provider, key))
-}
+
 pub fn availability() -> SystemUnlock {
-    let available = provider().is_ok();
+    let result = Native { window: 0 }
+        .capabilities()
+        .and_then(|(api, platform)| prf::check_capabilities(api, platform));
     SystemUnlock {
-        available,
+        available: result.is_ok(),
         enabled: false,
         label: "Windows Hello".into(),
-        reason: Some(
-            if available {
-                "需先在 Windows 设置中配置 Hello；启用时验证设备支持情况"
-            } else {
-                "Windows Hello 不可用，可继续使用主密码"
-            }
-            .into(),
-        ),
+        reason: Some(match result {
+            Ok(()) => "已通过 WebAuthn 基础能力检查；启用时需验证 PRF 和加密解锁".into(),
+            Err(error) => error.message,
+        }),
     }
 }
 pub fn protect(
@@ -294,144 +384,15 @@ pub fn protect(
     secret: &[u8],
     window: isize,
 ) -> Result<()> {
-    if secret.len() != 32 {
-        return Err(unavailable());
-    }
-    revoke(store, account)?;
-    let provider = provider()?;
-    let mut raw = 0;
-    check(
-        unsafe {
-            NCryptCreatePersistedKey(
-                provider.0,
-                &mut raw,
-                wide("RSA").as_ptr(),
-                key_name(account)?.as_ptr(),
-                0,
-                0,
-            )
-        },
-        "创建 RSA 密钥",
-    )?;
-    let mut key = Handle(raw);
-    let result = (|| {
-        property(&key, "Length", &2048u32.to_le_bytes())?;
-        property(&key, "Key Usage", &1u32.to_le_bytes())?;
-        property(&key, "Export Policy", &0u32.to_le_bytes())?;
-        set_cache_policy(&key)?;
-        ui_context(&key, window)?;
-        check(
-            unsafe { NCryptFinalizeKey(key.0, 0) },
-            "完成密钥创建 / Hello 授权",
-        )?;
-        verify_policy(&key)?;
-        let algorithm = wide("SHA256");
-        let padding = Oaep {
-            algorithm: algorithm.as_ptr(),
-            label: account.as_ptr(),
-            label_len: account.len() as u32,
-        };
-        let mut ciphertext = vec![0; 256];
-        let mut length = 0;
-        check(
-            unsafe {
-                NCryptEncrypt(
-                    key.0,
-                    secret.as_ptr(),
-                    32,
-                    &padding,
-                    ciphertext.as_mut_ptr(),
-                    256,
-                    &mut length,
-                    4,
-                )
-            },
-            "RSA-OAEP-SHA256 加密数据密钥",
-        )?;
-        if length != 256 {
-            return Err(AppError::new(
-                "system_auth",
-                "Windows Hello 加密结果长度异常（应为 256 字节）",
-            ));
-        }
-        store.write(&format!("hello:{account}"), &ciphertext)?;
-        let verified = unprotect(store, account, window)?;
-        if verified.as_slice() != secret {
-            return Err(AppError::new(
-                "system_auth",
-                "Windows Hello 密钥往返验证失败，请重新启用",
-            ));
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        // Delete only the key created by this enrollment attempt.
-        if unsafe { NCryptDeleteKey(key.0, 0) } == 0 {
-            key.0 = 0;
-        }
-        // Preserve the failing API/status rather than replacing it with a
-        // cleanup error after the user has already completed the Hello prompt.
-        let _ = store.delete(&format!("hello:{account}"));
-    }
-    result
+    prf::protect(store, &Native { window }, account, secret)
 }
 pub fn unprotect(
     store: &impl SecretStore,
     account: &str,
     window: isize,
 ) -> Result<Zeroizing<Vec<u8>>> {
-    let ciphertext = store
-        .read(&format!("hello:{account}"))?
-        .ok_or_else(unavailable)?;
-    if ciphertext.len() != 256 {
-        return Err(unavailable());
-    }
-    let (_provider, key) = open_key(account)?;
-    ui_context(&key, window)?;
-    // Require a fresh Hello gesture on every private-key operation.
-    property(&key, "PinCacheIsGestureRequired", &1u32.to_le_bytes())?;
-    let algorithm = wide("SHA256");
-    let padding = Oaep {
-        algorithm: algorithm.as_ptr(),
-        label: account.as_ptr(),
-        label_len: account.len() as u32,
-    };
-    let mut plain = Zeroizing::new(vec![0; 256]);
-    let mut length = 0;
-    check(
-        unsafe {
-            NCryptDecrypt(
-                key.0,
-                ciphertext.as_ptr(),
-                256,
-                &padding,
-                plain.as_mut_ptr(),
-                256,
-                &mut length,
-                4,
-            )
-        },
-        "RSA-OAEP-SHA256 解密 / Hello 授权",
-    )?;
-    if length != 32 {
-        return Err(AppError::new(
-            "system_auth",
-            "Windows Hello 解密结果长度异常（应为 32 字节）",
-        ));
-    }
-    plain.truncate(32);
-    Ok(plain)
+    prf::unprotect(store, &Native { window }, account)
 }
 pub fn revoke(store: &impl SecretStore, account: &str) -> Result<()> {
-    let provider = provider()?;
-    let mut raw = 0;
-    let status = unsafe { NCryptOpenKey(provider.0, &mut raw, key_name(account)?.as_ptr(), 0, 0) };
-    if status == 0 {
-        let mut key = Handle(raw);
-        check(unsafe { NCryptDeleteKey(key.0, 0) }, "删除旧密钥")?;
-        key.0 = 0; // NCryptDeleteKey consumes the handle.
-    } else if !matches!(status as u32, 0x8009000d | 0x80090016 | 0x80090011) {
-        check(status, "查找旧密钥")?;
-    }
-    store.delete(&format!("hello:{account}"))
+    prf::revoke(store, &Native { window: 0 }, account)
 }
