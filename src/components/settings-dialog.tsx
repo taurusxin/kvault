@@ -437,7 +437,7 @@ export function SettingsDialog({
               <div className="flex items-center justify-between border-t pt-4 text-[10px] text-muted-foreground">
                 <span className="flex items-center gap-1.5">
                   <ShieldCheck className="size-3.5" />
-                  KVault 0.2.0
+                  KVault 0.3.0
                 </span>
                 <span>本地优先 · 端到端加密</span>
               </div>

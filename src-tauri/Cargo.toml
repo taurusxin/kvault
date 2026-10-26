@@ -1,6 +1,6 @@
 [package]
 name = "kvault"
-version = "0.2.0"
+version = "0.3.0"
 description = "An encrypted, local-first key-value vault"
 authors = ["taurusxin"]
 edition = "2024"

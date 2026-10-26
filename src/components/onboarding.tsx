@@ -303,7 +303,7 @@ export function Onboarding() {
         </section>
       </div>
       <span className="absolute bottom-5 right-6 text-[10px] tracking-wider text-muted-foreground/60">
-        KVAULT / 0.2.0
+        KVAULT / 0.3.0
       </span>
     </main>
   );
