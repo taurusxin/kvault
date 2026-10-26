@@ -1,7 +1,6 @@
 import { Suspense, lazy, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ThemeProvider } from "@/lib/theme";
 import { toast } from "sonner";
 import { LoaderCircle } from "lucide-react";
@@ -19,6 +18,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { WindowBar } from "@/components/window-bar";
+import { CloseDialog } from "@/components/close-dialog";
 import { Onboarding } from "@/components/onboarding";
 import { desktop, useVault } from "@/stores/vault";
 import { errorMessage, type Snapshot, type SyncStatus } from "@/lib/types";
@@ -66,21 +66,6 @@ function App() {
       listen<SyncStatus>("sync:status", (e) =>
         useVault.getState().setSync(e.payload),
       ),
-    );
-    let closing = false;
-    add(
-      getCurrentWindow().onCloseRequested((event) => {
-        if (
-          !closing &&
-          (useVault.getState().dirty || useVault.getState().orderDirty)
-        ) {
-          event.preventDefault();
-          useVault.getState().navigate(() => {
-            closing = true;
-            void getCurrentWindow().close();
-          });
-        }
-      }),
     );
     let lastTouch = 0;
     const touch = () => {
@@ -216,6 +201,7 @@ function App() {
             </AlertDialogFooter>
           </AlertDialogContent>
         </AlertDialog>
+        <CloseDialog />
         <Toaster position="bottom-right" closeButton richColors />
       </TooltipProvider>
     </ThemeProvider>

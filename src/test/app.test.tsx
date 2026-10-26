@@ -8,6 +8,7 @@ import {
 } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import App from "@/App";
 import { useVault } from "@/stores/vault";
 import type { Snapshot } from "@/lib/types";
@@ -22,10 +23,6 @@ vi.mock("@tauri-apps/api/event", () => ({
 const windowMock = vi.hoisted(() => ({
   isMaximized: async () => false,
   onResized: async () => () => {},
-  onCloseRequested: vi.fn(
-    async (_handler: (event: { preventDefault: () => void }) => void) =>
-      () => {},
-  ),
   close: vi.fn(async () => {}),
   minimize: vi.fn(),
   toggleMaximize: vi.fn(),
@@ -78,6 +75,7 @@ const bootFixture = () => ({
     autoLock: { enabled: true, timeoutMinutes: 5 },
     theme: "system",
     systemUnlock: null,
+    close: { minimizeToTray: true, askBeforeClose: true },
   },
   systemUnlock: fixture().systemUnlock,
 });
@@ -110,8 +108,9 @@ beforeEach(() => {
     platform: "macos",
     autoLockHint: null,
     systemUnlock: null,
+    closeSettings: { minimizeToTray: true, askBeforeClose: true },
   });
-  vi.mocked(invoke).mockImplementation(async (command) =>
+  vi.mocked(invoke).mockImplementation(async (command, args) =>
     command === "bootstrap"
       ? {
           exists: true,
@@ -123,9 +122,20 @@ beforeEach(() => {
           },
           systemUnlock: fixture().systemUnlock,
         }
-      : undefined,
+      : command === "set_close_settings"
+        ? (args as { settings: unknown }).settings
+        : undefined,
   );
 });
+
+function requestClose(event = "app:close-requested") {
+  const registrations = vi
+    .mocked(listen)
+    .mock.calls.filter(([name]) => name === event);
+  const registration = registrations[registrations.length - 1];
+  expect(registration).toBeDefined();
+  act(() => registration![1]({ event, id: 1, payload: null }));
+}
 
 describe("保险库界面与会话", () => {
   it("系统解锁默认关闭，主密码入口始终存在且不会自动触发系统验证", async () => {
@@ -472,38 +482,90 @@ describe("保险库界面与会话", () => {
     );
     expect(screen.getByRole("button", { name: "保存设置" })).toBeEnabled();
   });
-  it("无未保存编辑时允许原生关闭事件继续执行", async () => {
-    useVault.getState().accept(fixture(), true);
-    render(<App />);
-    await waitFor(() => expect(windowMock.onCloseRequested).toHaveBeenCalled());
-    const calls = windowMock.onCloseRequested.mock.calls;
-    const handler = calls[calls.length - 1][0];
-    const event = { preventDefault: vi.fn() };
-    act(() => handler(event));
-    expect(event.preventDefault).not.toHaveBeenCalled();
-    expect(useVault.getState().pendingNavigation).toBeNull();
-  });
-  it("原生关闭有未保存编辑时提示，取消保留草稿，确认放弃后再次请求关闭", async () => {
+  it("关闭时默认询问，最小化保留草稿并保存不再询问的选择", async () => {
     useVault.getState().accept(fixture(), true);
     render(<App />);
     fireEvent.click(await screen.findByText("api.production.token"));
     fireEvent.change(screen.getByRole("textbox", { name: /Key/ }), {
       target: { value: "unsaved.key" },
     });
-    const calls = windowMock.onCloseRequested.mock.calls;
-    const handler = calls[calls.length - 1][0];
-    const event = { preventDefault: vi.fn() };
-    act(() => handler(event));
-    expect(event.preventDefault).toHaveBeenCalledOnce();
+    requestClose();
+    expect(screen.getByText("关闭 KVault")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("switch", { name: "下次关闭时仍然询问" }));
+    fireEvent.click(screen.getByRole("button", { name: "最小化到托盘" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("minimize_to_tray"),
+    );
+    expect(useVault.getState().closeSettings).toEqual({
+      minimizeToTray: true,
+      askBeforeClose: false,
+    });
+    expect(useVault.getState().dirty).toBe(true);
+    expect(useVault.getState().draft?.key).toBe("unsaved.key");
+    expect(useVault.getState().pendingNavigation).toBeNull();
+    expect(invoke).not.toHaveBeenCalledWith("exit_app");
+    requestClose();
+    await waitFor(() =>
+      expect(
+        vi
+          .mocked(invoke)
+          .mock.calls.filter(([command]) => command === "minimize_to_tray"),
+      ).toHaveLength(2),
+    );
+    expect(screen.queryByText("关闭 KVault")).not.toBeInTheDocument();
+  });
+  it("选择退出时保护草稿，取消后仍可编辑，确认放弃后退出", async () => {
+    useVault.getState().accept(fixture(), true);
+    render(<App />);
+    fireEvent.click(await screen.findByText("api.production.token"));
+    fireEvent.change(screen.getByRole("textbox", { name: /Key/ }), {
+      target: { value: "unsaved.key" },
+    });
+    requestClose();
+    fireEvent.click(screen.getByRole("button", { name: "退出应用" }));
+    await screen.findByText("有尚未保存的修改");
     fireEvent.click(screen.getByRole("button", { name: "继续编辑" }));
     expect(useVault.getState().dirty).toBe(true);
-    expect(windowMock.close).not.toHaveBeenCalled();
-    act(() => handler(event));
+    expect(invoke).not.toHaveBeenCalledWith("exit_app");
+    requestClose("app:exit-requested");
     fireEvent.click(screen.getByRole("button", { name: "放弃修改" }));
-    expect(windowMock.close).toHaveBeenCalledOnce();
-    const confirmed = { preventDefault: vi.fn() };
-    act(() => handler(confirmed));
-    expect(confirmed.preventDefault).not.toHaveBeenCalled();
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("exit_app"));
+  });
+  it("关闭询问后按配置直接退出，托盘退出不受最小化设置影响", async () => {
+    render(<App />);
+    await screen.findByLabelText("主密码");
+    act(() =>
+      useVault.setState({
+        closeSettings: { minimizeToTray: false, askBeforeClose: false },
+      }),
+    );
+    requestClose();
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("exit_app"));
+    expect(screen.queryByText("关闭 KVault")).not.toBeInTheDocument();
+    vi.mocked(invoke).mockClear();
+    act(() =>
+      useVault.setState({
+        closeSettings: { minimizeToTray: true, askBeforeClose: true },
+      }),
+    );
+    requestClose("app:exit-requested");
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("exit_app"));
+    expect(invoke).not.toHaveBeenCalledWith("minimize_to_tray");
+  });
+  it("通用设置中的两项关闭选项立即保存，失败时保留原值", async () => {
+    useVault.getState().accept(fixture(), true);
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "设置" }));
+    const minimize = screen.getByRole("switch", { name: "关闭时最小化到托盘" });
+    fireEvent.click(minimize);
+    await waitFor(() => expect(minimize).not.toBeChecked());
+    expect(invoke).toHaveBeenCalledWith("set_close_settings", {
+      settings: { minimizeToTray: false, askBeforeClose: true },
+    });
+    vi.mocked(invoke).mockRejectedValueOnce({ message: "无法保存关闭设置" });
+    fireEvent.click(screen.getByRole("switch", { name: "关闭时再次询问" }));
+    await screen.findByText("无法保存关闭设置");
+    expect(useVault.getState().closeSettings.askBeforeClose).toBe(true);
   });
   it("支持 Ctrl/Cmd 增减、Shift 按当前排序连续选择，以及筛选后的全选", async () => {
     useVault.getState().accept(selectionFixture(), true);
@@ -752,10 +814,7 @@ describe("保险库界面与会话", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "编辑排序" }));
     act(() => useVault.getState().reorderEntry("alpha", 0));
-    const calls = windowMock.onCloseRequested.mock.calls;
-    const event = { preventDefault: vi.fn() };
-    act(() => calls[calls.length - 1][0](event));
-    expect(event.preventDefault).toHaveBeenCalledOnce();
+    requestClose("app:exit-requested");
     expect(screen.getByText("有尚未保存的排序")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "继续编辑" }));
     expect(useVault.getState().orderDirty).toBe(true);

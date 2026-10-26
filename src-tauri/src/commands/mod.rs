@@ -45,6 +45,34 @@ pub fn set_theme(state: State<'_, Shared>, theme: crate::vault::preferences::The
     Ok(())
 }
 
+#[tauri::command]
+pub fn set_close_settings(
+    state: State<'_, Shared>,
+    settings: crate::vault::preferences::CloseSettings,
+) -> Result<crate::vault::preferences::CloseSettings> {
+    Ok(state
+        .vault
+        .lock()
+        .map_err(AppError::storage)?
+        .storage
+        .update_preferences(|p| p.close = settings)?
+        .close)
+}
+
+#[tauri::command]
+pub fn minimize_to_tray(window: tauri::WebviewWindow) -> Result<()> {
+    window
+        .hide()
+        .map_err(|_| AppError::new("window", "无法最小化到托盘，请重试"))
+}
+
+#[tauri::command]
+pub fn exit_app(state: State<'_, Shared>, app: AppHandle) -> Result<()> {
+    state.lock()?;
+    app.exit(0);
+    Ok(())
+}
+
 fn window_handle(_window: &tauri::WebviewWindow) -> Result<isize> {
     #[cfg(target_os = "windows")]
     return _window

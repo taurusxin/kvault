@@ -76,6 +76,11 @@ export interface Preferences {
   theme: "light" | "dark" | "system";
   autoLock: AutoLockSettings;
   systemUnlock: string | null;
+  close: CloseSettings;
+}
+export interface CloseSettings {
+  minimizeToTray: boolean;
+  askBeforeClose: boolean;
 }
 export interface AutoLockSettings {
   enabled: boolean;

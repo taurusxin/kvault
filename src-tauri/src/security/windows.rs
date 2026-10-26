@@ -100,28 +100,38 @@ impl Drop for Handle {
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
-fn check(status: i32) -> Result<()> {
+fn check(status: i32, stage: &str) -> Result<()> {
     if status == 0 {
-        return Ok(());
+        Ok(())
+    } else {
+        Err(status_error(status, stage))
     }
-    Err(if matches!(status as u32, 0x80090036 | 0x800704c7) {
+}
+fn status_error(status: i32, stage: &str) -> AppError {
+    if matches!(status as u32, 0x80090036 | 0x800704c7) {
         AppError::new("auth_cancelled", "已取消 Windows Hello，可使用主密码解锁")
     } else {
         AppError::new(
             "system_auth",
-            "Windows Hello 不可用或授权已失效，请使用主密码并重新启用",
+            format!(
+                "Windows Hello 在{stage}时失败（0x{:08X}），请使用主密码。",
+                status as u32
+            ),
         )
-    })
+    }
 }
 fn provider() -> Result<Handle> {
     let mut handle = 0;
-    check(unsafe {
-        NCryptOpenStorageProvider(
-            &mut handle,
-            wide("Microsoft Passport Key Storage Provider").as_ptr(),
-            0,
-        )
-    })?;
+    check(
+        unsafe {
+            NCryptOpenStorageProvider(
+                &mut handle,
+                wide("Microsoft Passport Key Storage Provider").as_ptr(),
+                0,
+            )
+        },
+        "打开 Passport 密钥提供程序",
+    )?;
     Ok(Handle(handle))
 }
 fn current_sid() -> Result<String> {
@@ -163,7 +173,10 @@ fn key_name(account: &str) -> Result<Vec<u16>> {
     Ok(wide(&format!("{}//KVault/v2/{account}", current_sid()?)))
 }
 fn property(key: &Handle, name: &str, value: &[u8]) -> Result<()> {
-    check(unsafe {
+    check(set_property(key, name, value), &format!("设置 {name}"))
+}
+fn set_property(key: &Handle, name: &str, value: &[u8]) -> i32 {
+    unsafe {
         NCryptSetProperty(
             key.0,
             wide(name).as_ptr(),
@@ -171,12 +184,15 @@ fn property(key: &Handle, name: &str, value: &[u8]) -> Result<()> {
             value.len() as u32,
             0,
         )
-    })
+    }
 }
 fn integer(key: &Handle, name: &str) -> Result<u32> {
+    integer_status(key, name).map_err(|status| status_error(status, &format!("读取 {name}")))
+}
+fn integer_status(key: &Handle, name: &str) -> std::result::Result<u32, i32> {
     let mut value = 0u32;
     let mut written = 0;
-    check(unsafe {
+    let status = unsafe {
         NCryptGetProperty(
             key.0,
             wide(name).as_ptr(),
@@ -185,20 +201,55 @@ fn integer(key: &Handle, name: &str) -> Result<u32> {
             &mut written,
             0,
         )
-    })?;
+    };
+    if status != 0 {
+        return Err(status);
+    }
     if written != 4 {
-        return Err(unavailable());
+        return Err(0x80090004u32 as i32); // NTE_BAD_LEN
     }
     Ok(value)
 }
+fn unsupported_property(status: i32) -> bool {
+    matches!(status as u32, 0x80090029 | 0x80090027 | 0x80070032)
+}
+fn set_cache_policy(key: &Handle) -> Result<()> {
+    let status = set_property(key, "NgcCacheType", &1u32.to_le_bytes());
+    if unsupported_property(status) {
+        // Older Passport providers expose the same policy under its old name.
+        // Never fall back to an authentication-optional key or software store.
+        property(key, "NgcCacheTypeProperty", &1u32.to_le_bytes())
+    } else {
+        check(status, "设置 NgcCacheType")
+    }
+}
+fn cache_policy(key: &Handle) -> Result<u32> {
+    match integer_status(key, "NgcCacheType") {
+        Err(status) if unsupported_property(status) => integer(key, "NgcCacheTypeProperty"),
+        Err(status) => Err(status_error(status, "读取 NgcCacheType")),
+        Ok(value) => Ok(value),
+    }
+}
 fn verify_policy(key: &Handle) -> Result<()> {
     // Reject imported/exportable or authentication-optional replacement keys.
-    if integer(key, "NgcCacheType")? != 1
-        || integer(key, "Key Usage")? & 8 != 0
-        || integer(key, "Export Policy")? != 0
-        || integer(key, "Length")? != 2048
-    {
-        return Err(unavailable());
+    for (property, actual, expected) in [
+        ("NgcCacheType", cache_policy(key)?, 1),
+        (
+            "Key Usage（允许解密、禁止导入）",
+            integer(key, "Key Usage")? & 9,
+            1,
+        ),
+        ("Export Policy", integer(key, "Export Policy")?, 0),
+        ("Length", integer(key, "Length")?, 2048),
+    ] {
+        if actual != expected {
+            return Err(AppError::new(
+                "system_auth",
+                format!(
+                    "Windows Hello 密钥策略校验失败：{property}（实际 {actual}，要求 {expected}），请使用主密码并重新启用。"
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -213,7 +264,10 @@ fn ui_context(key: &Handle, window: isize) -> Result<()> {
 fn open_key(account: &str) -> Result<(Handle, Handle)> {
     let provider = provider()?;
     let mut key = 0;
-    check(unsafe { NCryptOpenKey(provider.0, &mut key, key_name(account)?.as_ptr(), 0, 0) })?;
+    check(
+        unsafe { NCryptOpenKey(provider.0, &mut key, key_name(account)?.as_ptr(), 0, 0) },
+        "打开已创建的密钥",
+    )?;
     let key = Handle(key);
     verify_policy(&key)?;
     Ok((provider, key))
@@ -246,24 +300,30 @@ pub fn protect(
     revoke(store, account)?;
     let provider = provider()?;
     let mut raw = 0;
-    check(unsafe {
-        NCryptCreatePersistedKey(
-            provider.0,
-            &mut raw,
-            wide("RSA").as_ptr(),
-            key_name(account)?.as_ptr(),
-            0,
-            0,
-        )
-    })?;
+    check(
+        unsafe {
+            NCryptCreatePersistedKey(
+                provider.0,
+                &mut raw,
+                wide("RSA").as_ptr(),
+                key_name(account)?.as_ptr(),
+                0,
+                0,
+            )
+        },
+        "创建 RSA 密钥",
+    )?;
     let mut key = Handle(raw);
     let result = (|| {
         property(&key, "Length", &2048u32.to_le_bytes())?;
         property(&key, "Key Usage", &1u32.to_le_bytes())?;
         property(&key, "Export Policy", &0u32.to_le_bytes())?;
-        property(&key, "NgcCacheType", &1u32.to_le_bytes())?;
+        set_cache_policy(&key)?;
         ui_context(&key, window)?;
-        check(unsafe { NCryptFinalizeKey(key.0, 0) })?;
+        check(
+            unsafe { NCryptFinalizeKey(key.0, 0) },
+            "完成密钥创建 / Hello 授权",
+        )?;
         verify_policy(&key)?;
         let algorithm = wide("SHA256");
         let padding = Oaep {
@@ -273,25 +333,34 @@ pub fn protect(
         };
         let mut ciphertext = vec![0; 256];
         let mut length = 0;
-        check(unsafe {
-            NCryptEncrypt(
-                key.0,
-                secret.as_ptr(),
-                32,
-                &padding,
-                ciphertext.as_mut_ptr(),
-                256,
-                &mut length,
-                4,
-            )
-        })?;
+        check(
+            unsafe {
+                NCryptEncrypt(
+                    key.0,
+                    secret.as_ptr(),
+                    32,
+                    &padding,
+                    ciphertext.as_mut_ptr(),
+                    256,
+                    &mut length,
+                    4,
+                )
+            },
+            "RSA-OAEP-SHA256 加密数据密钥",
+        )?;
         if length != 256 {
-            return Err(unavailable());
+            return Err(AppError::new(
+                "system_auth",
+                "Windows Hello 加密结果长度异常（应为 256 字节）",
+            ));
         }
         store.write(&format!("hello:{account}"), &ciphertext)?;
         let verified = unprotect(store, account, window)?;
         if verified.as_slice() != secret {
-            return Err(unavailable());
+            return Err(AppError::new(
+                "system_auth",
+                "Windows Hello 密钥往返验证失败，请重新启用",
+            ));
         }
         Ok(())
     })();
@@ -300,7 +369,9 @@ pub fn protect(
         if unsafe { NCryptDeleteKey(key.0, 0) } == 0 {
             key.0 = 0;
         }
-        store.delete(&format!("hello:{account}"))?;
+        // Preserve the failing API/status rather than replacing it with a
+        // cleanup error after the user has already completed the Hello prompt.
+        let _ = store.delete(&format!("hello:{account}"));
     }
     result
 }
@@ -327,20 +398,26 @@ pub fn unprotect(
     };
     let mut plain = Zeroizing::new(vec![0; 256]);
     let mut length = 0;
-    check(unsafe {
-        NCryptDecrypt(
-            key.0,
-            ciphertext.as_ptr(),
-            256,
-            &padding,
-            plain.as_mut_ptr(),
-            256,
-            &mut length,
-            4,
-        )
-    })?;
+    check(
+        unsafe {
+            NCryptDecrypt(
+                key.0,
+                ciphertext.as_ptr(),
+                256,
+                &padding,
+                plain.as_mut_ptr(),
+                256,
+                &mut length,
+                4,
+            )
+        },
+        "RSA-OAEP-SHA256 解密 / Hello 授权",
+    )?;
     if length != 32 {
-        return Err(unavailable());
+        return Err(AppError::new(
+            "system_auth",
+            "Windows Hello 解密结果长度异常（应为 32 字节）",
+        ));
     }
     plain.truncate(32);
     Ok(plain)
@@ -351,10 +428,10 @@ pub fn revoke(store: &impl SecretStore, account: &str) -> Result<()> {
     let status = unsafe { NCryptOpenKey(provider.0, &mut raw, key_name(account)?.as_ptr(), 0, 0) };
     if status == 0 {
         let mut key = Handle(raw);
-        check(unsafe { NCryptDeleteKey(key.0, 0) })?;
+        check(unsafe { NCryptDeleteKey(key.0, 0) }, "删除旧密钥")?;
         key.0 = 0; // NCryptDeleteKey consumes the handle.
     } else if !matches!(status as u32, 0x8009000d | 0x80090016 | 0x80090011) {
-        check(status)?;
+        check(status, "查找旧密钥")?;
     }
     store.delete(&format!("hello:{account}"))
 }

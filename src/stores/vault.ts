@@ -5,6 +5,7 @@ import type {
   Action,
   AutoLockSettings,
   Bootstrap,
+  CloseSettings,
   Draft,
   Entry,
   Snapshot,
@@ -30,9 +31,11 @@ interface VaultStore {
   exists: boolean;
   platform: string;
   snapshot: Snapshot | null;
-  // Only the non-sensitive lock-screen hint survives locking, in memory only.
+  // Non-sensitive device preferences and lock-screen hints survive locking.
   autoLockHint: AutoLockSettings | null;
   systemUnlock: SystemUnlock | null;
+  closeSettings: CloseSettings;
+  setCloseSettings: (settings: CloseSettings) => Promise<void>;
   lifecycle: number;
   selectedTable: string | null;
   selectedEntry: string | null;
@@ -84,6 +87,13 @@ export const useVault = create<VaultStore>((set, get) => ({
   snapshot: null,
   autoLockHint: null,
   systemUnlock: null,
+  closeSettings: { minimizeToTray: true, askBeforeClose: true },
+  setCloseSettings: async (settings) => {
+    const saved = await invoke<CloseSettings>("set_close_settings", {
+      settings,
+    });
+    set({ closeSettings: saved });
+  },
   lifecycle: 0,
   selectedTable: null,
   selectedEntry: null,
@@ -111,6 +121,10 @@ export const useVault = create<VaultStore>((set, get) => ({
       platform: boot.platform,
       autoLockHint: state.snapshot?.autoLock ?? boot.preferences.autoLock,
       systemUnlock: state.snapshot?.systemUnlock ?? boot.systemUnlock,
+      closeSettings: boot.preferences.close ?? {
+        minimizeToTray: true,
+        askBeforeClose: true,
+      },
     }));
   },
   accept: (snapshot, fresh = false) => {

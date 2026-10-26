@@ -8,7 +8,7 @@
 
 | 位置               | 内容                                                                                 | 访问条件                                                                 |
 | ------------------ | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------ |
-| `config.json`      | 版本、主题、自动锁定开关及分钟数、系统解锁授权的文件头指纹                           | 本机明文，严格字段和取值校验；16 KiB 上限                                |
+| `config.json`      | 版本、主题、自动锁定开关及分钟数、关闭行为与询问开关、系统解锁授权的文件头指纹       | 本机明文，严格字段和取值校验；16 KiB 上限                                |
 | `vault.kvault`     | 表、Key、Value、备注、排序、时间戳、墓碑、合并基线、冲突、修订号、恢复日志、凭据引用 | v2 二进制认证加密                                                        |
 | 系统凭据库         | S3/WebDAV 完整配置及密码、密钥、Session Token                                        | macOS login Keychain / Windows Credential Manager / Linux Secret Service |
 | 独立的系统解锁凭据 | 由本机硬件或 Windows Hello 保护的数据密钥封装                                        | 每次解封需要系统验证，默认不创建                                         |
@@ -72,6 +72,8 @@ login Keychain 只保存二进制封装：Secure Enclave 的不透明私钥表�
 私钥启用 `NgcCacheType=AUTH_MANDATORY`，解密前设置 `PinCacheIsGestureRequired`，并检查认证策略、密钥长度、导出策略和禁止导入标记。`NCryptDecrypt` 成功后才得到 DEK，使用 Hello PIN、指纹或面容由 Windows 决定。界面窗口句柄传入 CNG，用于原生对话框归属。提供程序不支持必要策略、未配置 Hello 或用户取消时明确失败，不退回到仅 DPAPI 或仅验证弹窗的方案。
 
 需要在真实 Windows 设备验收提供程序、RSA-OAEP 支持和每次验证行为。交叉编译检查不等于实际 Hello 验证。
+
+Windows 原生错误显示失败阶段、属性名称和十六进制 `SECURITY_STATUS`，不包含密码、数据密钥、密文或凭据。认证缓存属性兼容旧名 `NgcCacheTypeProperty`，仅在提供程序明确不支持当前属性名时尝试，仍要求 `AUTH_MANDATORY` 和每次私钥操作验证。调查与复测步骤见 [Windows Hello 调查](windows-hello-investigation.md)。
 
 ### 授权清理与并发
 

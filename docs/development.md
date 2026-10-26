@@ -45,6 +45,7 @@ kvault/
 │   ├── icons/               # 各平台桌面图标
 │   └── src/
 │       ├── commands/        # Tauri IPC 命令
+│       ├── desktop.rs       # 托盘、窗口关闭拦截与系统退出
 │       ├── sync/            # 远端存储、合并与同步队列
 │       ├── security/        # 系统凭据库、Secure Enclave / Windows Hello
 │       └── vault/           # 数据模型、加密、持久化与批量导入

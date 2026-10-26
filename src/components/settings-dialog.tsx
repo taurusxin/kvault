@@ -48,6 +48,8 @@ export function SettingsDialog({
 }) {
   const snapshot = useVault((s) => s.snapshot);
   const mutate = useVault((s) => s.mutate);
+  const closeSettings = useVault((s) => s.closeSettings);
+  const setCloseSettings = useVault((s) => s.setCloseSettings);
   const { theme, setTheme } = useTheme();
   const [config, setConfig] = useState(emptyS3);
   const [working, setWorking] = useState(false);
@@ -244,10 +246,62 @@ export function SettingsDialog({
                       <Icon className="size-5" strokeWidth={1.5} />
                       {label}
                       {theme === value && (
-                        <Check className="absolute right-2 top-2 size-3.5" aria-hidden="true" />
+                        <Check
+                          className="absolute right-2 top-2 size-3.5"
+                          aria-hidden="true"
+                        />
                       )}
                     </Button>
                   ))}
+                </div>
+              </div>
+              <div className="space-y-4 rounded-xl border p-4">
+                <p className="text-xs font-medium">窗口关闭行为</p>
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <Label htmlFor="close-minimize" className="text-xs">
+                      关闭时最小化到托盘
+                    </Label>
+                    <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
+                      开启后继续在后台运行；关闭后退出应用。托盘菜单中的退出始终退出应用。
+                    </p>
+                  </div>
+                  <Switch
+                    id="close-minimize"
+                    checked={closeSettings.minimizeToTray}
+                    disabled={working}
+                    onCheckedChange={(value) =>
+                      void run(() =>
+                        setCloseSettings({
+                          ...closeSettings,
+                          minimizeToTray: value,
+                        }),
+                      )
+                    }
+                  />
+                </div>
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <Label htmlFor="close-ask" className="text-xs">
+                      关闭时再次询问
+                    </Label>
+                    <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
+                      每次关闭时选择退出或最小化；关闭询问后直接使用上方设置。更改后立即保存。
+                    </p>
+                  </div>
+                  <Switch
+                    id="close-ask"
+                    checked={closeSettings.askBeforeClose}
+                    disabled={working}
+                    onCheckedChange={(value) =>
+                      void run(() =>
+                        setCloseSettings({
+                          ...closeSettings,
+                          askBeforeClose: value,
+                        }),
+                      )
+                    }
+                  />
                 </div>
               </div>
               <form
