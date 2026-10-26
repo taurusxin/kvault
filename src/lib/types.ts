@@ -1,6 +1,7 @@
 export interface Table {
   id: string;
   name: string;
+  sortOrder?: number;
   createdAt: number;
   updatedAt: number;
   deleted: boolean;
@@ -108,6 +109,7 @@ export interface Draft {
 export type Action =
   | { type: "setAutoLock"; settings: AutoLockSettings }
   | { type: "createTable"; name: string }
+  | { type: "reorderTables"; ids: string[] }
   | { type: "renameTable"; id: string; name: string }
   | { type: "deleteTable"; id: string }
   | { type: "saveEntry"; input: Draft }

@@ -116,18 +116,20 @@ impl Vault {
     }
     pub fn snapshot(&self) -> Result<Snapshot> {
         let session = self.session.as_ref().ok_or_else(AppError::locked)?;
+        let mut tables: Vec<_> = session
+            .state
+            .document
+            .tables
+            .iter()
+            .filter(|t| !t.deleted)
+            .cloned()
+            .collect();
+        tables.sort_by(model::compare_table_order);
         Ok(Snapshot {
             session_id: self.generation,
             vault_id: session.keys.header.vault_id.clone(),
             epoch: session.keys.header.epoch,
-            tables: session
-                .state
-                .document
-                .tables
-                .iter()
-                .filter(|t| !t.deleted)
-                .cloned()
-                .collect(),
+            tables,
             entries: session
                 .state
                 .document
@@ -206,13 +208,50 @@ impl Vault {
             }
             Action::CreateTable { name } => {
                 let name = table_name(&state.document, &name, None)?;
+                let sort_order = state
+                    .document
+                    .tables
+                    .iter()
+                    .map(|table| table.sort_order)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
                 state.document.tables.push(Table {
                     id: id(),
                     name,
+                    sort_order,
                     created_at: now(),
                     updated_at: now(),
                     deleted: false,
                 });
+            }
+            Action::ReorderTables { ids } => {
+                let scope: HashSet<_> = state
+                    .document
+                    .tables
+                    .iter()
+                    .filter(|table| !table.deleted)
+                    .map(|table| table.id.clone())
+                    .collect();
+                if ids.is_empty()
+                    || ids.len() != scope.len()
+                    || ids.iter().collect::<HashSet<_>>().len() != ids.len()
+                    || ids.iter().any(|id| !scope.contains(id))
+                {
+                    return Err(AppError::invalid(
+                        "数据表列表已变化，请重新拖动，未保存任何排序",
+                    ));
+                }
+                let positions: std::collections::HashMap<_, _> = ids
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, id)| (id, index as u64 + 1))
+                    .collect();
+                for table in &mut state.document.tables {
+                    if let Some(position) = positions.get(&table.id) {
+                        table.sort_order = *position;
+                    }
+                }
             }
             Action::RenameTable { id, name } => {
                 let name = table_name(&state.document, &name, Some(&id))?;
@@ -542,6 +581,9 @@ pub enum Action {
     },
     CreateTable {
         name: String,
+    },
+    ReorderTables {
+        ids: Vec<String>,
     },
     RenameTable {
         id: String,

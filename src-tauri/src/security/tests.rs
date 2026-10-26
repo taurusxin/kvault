@@ -95,6 +95,7 @@ fn fixture(secrets: Arc<ControlledSecrets>) -> (vault::Shared, tempfile::TempDir
             tables: vec![Table {
                 id: table_id.clone(),
                 name: "私密分类".into(),
+                sort_order: 1,
                 created_at: 1,
                 updated_at: 1,
                 deleted: false,

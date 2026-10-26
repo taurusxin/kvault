@@ -51,6 +51,7 @@ interface VaultStore {
   orderDirty: boolean;
   visible: boolean;
   listValuesVisible: boolean;
+  listValueOverrides: Record<string, boolean>;
   query: string;
   busy: boolean;
   sync: SyncStatus;
@@ -68,12 +69,14 @@ interface VaultStore {
   startOrdering: (ids: string[]) => void;
   reorderEntry: (id: string, index: number) => void;
   cancelOrdering: () => void;
+  reorderTable: (id: string, index: number) => Promise<void>;
   newEntry: () => void;
   edit: (patch: Partial<Draft>) => void;
   save: () => Promise<void>;
   mutate: (action: Action) => Promise<Snapshot | null>;
   setSync: (status: SyncStatus) => void;
   toggleValues: () => void;
+  toggleEntryValue: (id: string) => void;
 }
 const localSync: SyncStatus = {
   state: "local",
@@ -105,6 +108,7 @@ export const useVault = create<VaultStore>((set, get) => ({
   orderDirty: false,
   visible: false,
   listValuesVisible: false,
+  listValueOverrides: {},
   query: "",
   busy: false,
   sync: localSync,
@@ -153,6 +157,7 @@ export const useVault = create<VaultStore>((set, get) => ({
         orderDirty: false,
         visible: false,
         listValuesVisible: false,
+        listValueOverrides: {},
         query: "",
         busy: false,
         sync: {
@@ -225,6 +230,11 @@ export const useVault = create<VaultStore>((set, get) => ({
           JSON.stringify(orderDraft.originalIds)
         : false,
       selectedIds,
+      listValueOverrides: Object.fromEntries(
+        Object.entries(current.listValueOverrides).filter(([id]) =>
+          snapshot.entries.some((entry) => entry.id === id),
+        ),
+      ),
       selectionAnchor: selectedIds.includes(current.selectionAnchor ?? "")
         ? current.selectionAnchor
         : null,
@@ -266,6 +276,7 @@ export const useVault = create<VaultStore>((set, get) => ({
       orderDirty: false,
       visible: false,
       listValuesVisible: false,
+      listValueOverrides: {},
       query: "",
       busy: false,
       pendingNavigation: null,
@@ -342,7 +353,8 @@ export const useVault = create<VaultStore>((set, get) => ({
           selectedEntry: latest.id,
           draft: toDraft(latest),
           dirty: false,
-          visible: get().listValuesVisible,
+          visible:
+            get().listValueOverrides[latest.id] ?? get().listValuesVisible,
         });
     });
   },
@@ -396,6 +408,17 @@ export const useVault = create<VaultStore>((set, get) => ({
       };
     }),
   cancelOrdering: () => set({ orderDraft: null, orderDirty: false }),
+  reorderTable: async (id, index) => {
+    const state = get();
+    if (!state.snapshot || state.busy || state.orderDraft) return;
+    const ids = state.snapshot.tables.map((table) => table.id);
+    const previous = ids.indexOf(id);
+    if (previous < 0 || index < 0 || index >= ids.length || index === previous)
+      return;
+    ids.splice(previous, 1);
+    ids.splice(index, 0, id);
+    await get().mutate({ type: "reorderTables", ids });
+  },
   newEntry: () => {
     const state = get();
     const tableId = state.selectedTable ?? state.snapshot?.tables[0]?.id;
@@ -485,6 +508,21 @@ export const useVault = create<VaultStore>((set, get) => ({
   toggleValues: () =>
     set((state) => ({
       listValuesVisible: !state.listValuesVisible,
+      listValueOverrides: {},
       visible: !state.listValuesVisible,
     })),
+  toggleEntryValue: (id) =>
+    set((state) => {
+      if (!state.snapshot?.entries.some((entry) => entry.id === id)) return {};
+      const visible = !(
+        state.listValueOverrides[id] ?? state.listValuesVisible
+      );
+      const overrides = { ...state.listValueOverrides };
+      if (visible === state.listValuesVisible) delete overrides[id];
+      else overrides[id] = visible;
+      return {
+        listValueOverrides: overrides,
+        ...(state.draft?.id === id ? { visible } : {}),
+      };
+    }),
 }));

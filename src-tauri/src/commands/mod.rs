@@ -271,6 +271,7 @@ pub async fn create_vault(
         local.document.tables.push(Table {
             id: id(),
             name: "默认表".into(),
+            sort_order: 1,
             created_at: now(),
             updated_at: now(),
             deleted: false,

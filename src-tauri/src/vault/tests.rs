@@ -479,6 +479,100 @@ fn batch_move_and_delete_are_atomic_and_preserve_identity() {
 }
 
 #[test]
+fn table_order_is_validated_encrypted_and_new_tables_append() {
+    let (mut vault, _dir) = fixture();
+    let sid = vault.generation;
+    for name in ["A", "B", "C"] {
+        vault
+            .mutate(sid, Action::CreateTable { name: name.into() })
+            .unwrap();
+    }
+    let original = vault.snapshot().unwrap();
+    let ids: Vec<_> = original
+        .tables
+        .iter()
+        .map(|table| table.id.clone())
+        .collect();
+    let before = vault.storage.read(&vault.storage.path()).unwrap();
+    for invalid in [
+        vec![],
+        vec![ids[0].clone()],
+        vec![ids[0].clone(), ids[0].clone(), ids[2].clone()],
+        vec![ids[0].clone(), ids[1].clone(), "missing".into()],
+    ] {
+        assert!(
+            vault
+                .mutate(sid, Action::ReorderTables { ids: invalid })
+                .is_err()
+        );
+        assert_eq!(vault.storage.read(&vault.storage.path()).unwrap(), before);
+        assert_eq!(vault.snapshot().unwrap().revision, original.revision);
+    }
+    let reversed: Vec<_> = ids.iter().rev().cloned().collect();
+    let result = vault
+        .mutate(
+            sid,
+            Action::ReorderTables {
+                ids: reversed.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        result
+            .tables
+            .iter()
+            .map(|table| table.id.clone())
+            .collect::<Vec<_>>(),
+        reversed
+    );
+    for table in &result.tables {
+        let previous = original
+            .tables
+            .iter()
+            .find(|old| old.id == table.id)
+            .unwrap();
+        assert_eq!(table.name, previous.name);
+        assert_eq!(table.updated_at, previous.updated_at);
+    }
+    let stored: LocalState = crypto::open(
+        &vault.storage.read(&vault.storage.path()).unwrap(),
+        &vault.session.as_ref().unwrap().keys,
+        "local",
+    )
+    .unwrap();
+    let mut restored = stored.document.tables;
+    restored.sort_by(model::compare_table_order);
+    assert_eq!(restored, result.tables);
+    let result = vault
+        .mutate(sid, Action::CreateTable { name: "D".into() })
+        .unwrap();
+    assert_eq!(result.tables.last().unwrap().name, "D");
+    let deleted = result.tables[1].id.clone();
+    vault
+        .mutate(sid, Action::DeleteTable { id: deleted })
+        .unwrap();
+    let mut live: Vec<_> = vault
+        .snapshot()
+        .unwrap()
+        .tables
+        .iter()
+        .map(|table| table.id.clone())
+        .collect();
+    live.reverse();
+    assert!(
+        vault
+            .mutate(sid, Action::ReorderTables { ids: live })
+            .is_ok()
+    );
+    let mut legacy = serde_json::to_value(&original.tables[0]).unwrap();
+    legacy.as_object_mut().unwrap().remove("sortOrder");
+    assert_eq!(
+        serde_json::from_value::<Table>(legacy).unwrap().sort_order,
+        0
+    );
+}
+
+#[test]
 fn custom_order_is_atomic_scoped_and_encrypted_with_legacy_compatibility() {
     let (mut vault, _dir) = fixture();
     let sid = vault.generation;
@@ -655,6 +749,7 @@ fn seed_native_qa_fixture() {
         state.document.tables.push(Table {
             id: table_id.clone(),
             name: name.into(),
+            sort_order: 0,
             created_at: now(),
             updated_at: now(),
             deleted: false,

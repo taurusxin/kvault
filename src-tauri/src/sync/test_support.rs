@@ -80,6 +80,7 @@ impl Server {
         local.document.tables.push(Table {
             id: id(),
             name: "工作".into(),
+            sort_order: 1,
             created_at: 1,
             updated_at: 1,
             deleted: false,

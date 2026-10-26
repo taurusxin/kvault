@@ -1,12 +1,22 @@
-import { useState, type ReactNode } from "react";
-import { DragDropProvider } from "@dnd-kit/react";
+import {
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
+import {
+  DragDropProvider,
+  PointerSensor,
+  KeyboardSensor,
+} from "@dnd-kit/react";
+import { PointerActivationConstraints } from "@dnd-kit/dom";
 import { useSortable, isSortable } from "@dnd-kit/react/sortable";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import {
-  ArrowDownAZ,
-  ArrowUpDown,
   Check,
+  ChevronDown,
   ChevronRight,
   Cloud,
   CloudOff,
@@ -37,12 +47,20 @@ import {
   Upload,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
-import { Switch } from "@/components/ui/switch";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 import {
   Select,
   SelectContent,
@@ -98,6 +116,10 @@ import {
 import { SettingsDialog, type SettingsTab } from "@/components/settings-dialog";
 import { ConflictsDialog } from "@/components/conflicts-dialog";
 import { BulkImportDialog } from "@/components/bulk-import-dialog";
+import {
+  fitRecordColumns,
+  type RecordColumnWidths,
+} from "@/lib/record-columns";
 
 const date = (time: number) =>
   new Intl.DateTimeFormat("zh-CN", {
@@ -107,6 +129,15 @@ const date = (time: number) =>
     minute: "2-digit",
     hour12: false,
   }).format(time);
+
+const tableSensors = [
+  PointerSensor.configure({
+    activationConstraints: [
+      new PointerActivationConstraints.Delay({ value: 350, tolerance: 6 }),
+    ],
+  }),
+  KeyboardSensor,
+];
 
 export function Workspace() {
   const store = useVault();
@@ -123,8 +154,27 @@ export function Workspace() {
     detail: string;
     action: Action;
   } | null>(null);
-  const [sort, setSort] = useState<"manual" | "updated" | "key">("manual");
+  const [keyWidth, setKeyWidth] = useState(200);
+  const [valueWidth, setValueWidth] = useState(180);
+  const listViewport = useRef<HTMLDivElement>(null);
+  const [viewportWidth, setViewportWidth] = useState<number | null>(null);
+  const columns = fitRecordColumns(
+    keyWidth,
+    valueWidth,
+    viewportWidth ?? Infinity,
+  );
+  useLayoutEffect(() => {
+    const viewport = listViewport.current;
+    if (!viewport) return;
+    if (viewport.clientWidth > 0) setViewportWidth(viewport.clientWidth);
+    const observer = new ResizeObserver(([entry]) => {
+      if (entry) setViewportWidth(entry.contentRect.width);
+    });
+    observer.observe(viewport);
+    return () => observer.disconnect();
+  }, []);
   const [dragging, setDragging] = useState(false);
+  const tableDragClickUntil = useRef(0);
   const ordering = Boolean(store.orderDraft);
   const draftPositions = new Map(
     store.orderDraft?.ids.map((id, index) => [id, index]) ?? [],
@@ -148,17 +198,31 @@ export function Workspace() {
     .sort((a, b) =>
       ordering
         ? (draftPositions.get(a.id) ?? 0) - (draftPositions.get(b.id) ?? 0)
-        : sort === "key"
-          ? a.key.localeCompare(b.key)
-          : sort === "updated"
-            ? b.updatedAt - a.updatedAt
-            : compareEntryOrder(a, b),
+        : compareEntryOrder(a, b),
     );
+  const isValueVisible = (id: string) =>
+    store.listValueOverrides[id] ?? store.listValuesVisible;
+  const visibleValueCount = filtered.filter((entry) =>
+    isValueVisible(entry.id),
+  ).length;
   const selectedIds = new Set(store.selectedIds);
   const selection = snapshot.entries.filter((entry) =>
     selectedIds.has(entry.id),
   );
   const orderedIds = filtered.map((entry) => entry.id);
+  const selectedVisibleCount = orderedIds.filter((id) =>
+    selectedIds.has(id),
+  ).length;
+  function resizeKey(width: number) {
+    setKeyWidth(width);
+    if (viewportWidth !== null)
+      setValueWidth(Math.max(0, viewportWidth - 124 - width));
+  }
+  function resizeValue(width: number) {
+    setValueWidth(width);
+    if (viewportWidth !== null)
+      setKeyWidth(Math.max(0, viewportWidth - 124 - width));
+  }
   function moveEntries(ids = store.selectedIds) {
     const selected = new Set(ids);
     const entries = snapshot.entries.filter((entry) => selected.has(entry.id));
@@ -278,77 +342,115 @@ export function Workspace() {
             <Plus className="size-3.5" />
           </Button>
         </div>
-        <ScrollArea className="min-h-0 flex-1 px-3">
-          <div className="space-y-1 pb-5">
-            {snapshot.tables.map((table) => (
-              <div
-                key={table.id}
-                className={`group flex h-9 items-center gap-0.5 rounded-lg ${store.selectedTable === table.id ? "bg-accent" : "hover:bg-accent/60"}`}
-              >
-                <Button
-                  variant="ghost"
-                  className="h-full min-w-0 flex-1 justify-start gap-2 text-xs hover:bg-transparent"
-                  onClick={() => store.selectTable(table.id)}
+        <DragDropProvider
+          sensors={tableSensors}
+          onDragStart={() => {
+            tableDragClickUntil.current = Infinity;
+          }}
+          onDragEnd={(event) => {
+            tableDragClickUntil.current = performance.now() + 100;
+            const { source } = event.operation;
+            if (!event.canceled && isSortable(source))
+              void store
+                .reorderTable(String(source.id), source.index)
+                .catch((error) => toast.error(errorMessage(error)));
+          }}
+        >
+          <ScrollArea className="min-h-0 flex-1 px-3" aria-label="数据表列表">
+            <div className="space-y-1 pb-5">
+              {snapshot.tables.map((table, index) => (
+                <SortableRecord
+                  key={table.id}
+                  id={table.id}
+                  index={index}
+                  enabled={snapshot.tables.length > 1}
+                  disabled={readOnly || store.busy || ordering}
                 >
-                  <Table2 className="size-3.5 text-muted-foreground" />
-                  <span className="truncate">{table.name}</span>
-                  <span className="ml-auto text-[10px] text-muted-foreground group-hover:hidden">
-                    {
-                      snapshot.entries.filter((e) => e.tableId === table.id)
-                        .length
-                    }
-                  </span>
-                </Button>
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="icon-xs"
-                      aria-label={`${table.name}的操作`}
-                      className="mr-1 hidden group-hover:flex data-[state=open]:flex"
-                      disabled={readOnly}
+                  {({ ref, handleRef, isDragSource }) => (
+                    <div
+                      ref={ref}
+                      className={`group flex h-9 items-center gap-0.5 rounded-lg ${isDragSource ? "relative z-20 bg-accent shadow-lg" : store.selectedTable === table.id ? "bg-accent" : "hover:bg-accent/60"}`}
                     >
-                      <MoreHorizontal className="size-3.5" />
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="start">
-                    <DropdownMenuItem
-                      onSelect={() =>
-                        store.navigate(() =>
-                          setTableDialog({ id: table.id, name: table.name }),
-                        )
-                      }
-                    >
-                      <Pencil />
-                      重命名
-                    </DropdownMenuItem>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem
-                      variant="destructive"
-                      onSelect={() =>
-                        store.navigate(() =>
-                          setDeletion({
-                            title: `删除「${table.name}」？`,
-                            detail: `此表包含 ${snapshot.entries.filter((e) => e.tableId === table.id).length} 条记录，删除后将同步到其他设备。`,
-                            action: { type: "deleteTable", id: table.id },
-                          }),
-                        )
-                      }
-                    >
-                      <Trash2 />
-                      删除表
-                    </DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </div>
-            ))}
-            {!snapshot.tables.length && (
-              <p className="px-2 py-3 text-xs text-muted-foreground">
-                新建一张表，开始整理记录。
-              </p>
-            )}
-          </div>
-        </ScrollArea>
+                      <Button
+                        ref={handleRef}
+                        variant="ghost"
+                        className="h-full min-w-0 flex-1 touch-none justify-start gap-2 text-xs hover:bg-transparent"
+                        aria-label={`选择数据表：${table.name}`}
+                        title="长按拖动调整顺序，也可按空格后用方向键移动"
+                        onClick={(event) => {
+                          if (
+                            !event.defaultPrevented &&
+                            performance.now() > tableDragClickUntil.current
+                          )
+                            store.selectTable(table.id);
+                        }}
+                      >
+                        <Table2 className="size-3.5 text-muted-foreground" />
+                        <span className="truncate">{table.name}</span>
+                        <span className="ml-auto text-[10px] text-muted-foreground group-hover:hidden">
+                          {
+                            snapshot.entries.filter(
+                              (e) => e.tableId === table.id,
+                            ).length
+                          }
+                        </span>
+                      </Button>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon-xs"
+                            aria-label={`${table.name}的操作`}
+                            className="mr-1 hidden group-hover:flex data-[state=open]:flex"
+                            disabled={readOnly}
+                          >
+                            <MoreHorizontal className="size-3.5" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="start">
+                          <DropdownMenuItem
+                            onSelect={() =>
+                              store.navigate(() =>
+                                setTableDialog({
+                                  id: table.id,
+                                  name: table.name,
+                                }),
+                              )
+                            }
+                          >
+                            <Pencil />
+                            重命名
+                          </DropdownMenuItem>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem
+                            variant="destructive"
+                            onSelect={() =>
+                              store.navigate(() =>
+                                setDeletion({
+                                  title: `删除「${table.name}」？`,
+                                  detail: `此表包含 ${snapshot.entries.filter((e) => e.tableId === table.id).length} 条记录，删除后将同步到其他设备。`,
+                                  action: { type: "deleteTable", id: table.id },
+                                }),
+                              )
+                            }
+                          >
+                            <Trash2 />
+                            删除表
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
+                  )}
+                </SortableRecord>
+              ))}
+              {!snapshot.tables.length && (
+                <p className="px-2 py-3 text-xs text-muted-foreground">
+                  新建一张表，开始整理记录。
+                </p>
+              )}
+            </div>
+          </ScrollArea>
+        </DragDropProvider>
         <div className="border-t p-3">
           <button
             className="mb-3 flex w-full items-center gap-2 rounded-lg border bg-background/60 p-2.5 text-left transition hover:bg-background"
@@ -426,6 +528,70 @@ export function Workspace() {
             </p>
           </div>
           <div className="flex gap-2">
+            {selection.length > 0 && !ordering && (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="outline" className="text-xs">
+                    已选择 {selection.length} 条
+                    <ChevronDown />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-44">
+                  {selection.length === 1 && (
+                    <>
+                      <DropdownMenuItem
+                        disabled={readOnly || store.busy}
+                        onSelect={() => store.openEntry(selection[0])}
+                      >
+                        <Pencil />
+                        编辑记录
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        onSelect={() => void copyEntry(selection[0].id, "key")}
+                      >
+                        <KeyRound />
+                        复制 Key
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        onSelect={() =>
+                          void copyEntry(selection[0].id, "value")
+                        }
+                      >
+                        <Copy />
+                        复制 Value
+                      </DropdownMenuItem>
+                      <DropdownMenuSeparator />
+                    </>
+                  )}
+                  <DropdownMenuItem
+                    disabled={
+                      readOnly || store.busy || snapshot.tables.length < 2
+                    }
+                    onSelect={() => moveEntries()}
+                  >
+                    <FolderInput />
+                    移动到数据表…
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    variant="destructive"
+                    disabled={readOnly || store.busy}
+                    onSelect={() => deleteEntries()}
+                  >
+                    <Trash2 />
+                    {selection.length > 1 ? "删除所选记录…" : "删除记录…"}
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    onSelect={() => store.selectEntries(orderedIds)}
+                  >
+                    全选当前列表
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => store.selectEntries([])}>
+                    取消选择
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
             <Button
               variant="outline"
               className="text-xs"
@@ -502,7 +668,7 @@ export function Workspace() {
                   value={store.query}
                   disabled={ordering}
                   onChange={(e) => store.setQuery(e.target.value)}
-                  className="h-8 border-0 bg-transparent px-0 text-xs shadow-none focus-visible:ring-0 dark:bg-transparent"
+                  className="h-8 border-0 bg-transparent px-0 text-xs shadow-none focus-visible:ring-0 disabled:bg-transparent dark:bg-transparent dark:disabled:bg-transparent"
                 />
                 {store.query && (
                   <Button
@@ -514,61 +680,29 @@ export function Workspace() {
                     <X />
                   </Button>
                 )}
-                <div className="ml-1 flex shrink-0 items-center gap-1.5 border-l pl-3">
-                  <Switch
-                    id="list-values-visible"
-                    aria-label="显示全部 Value"
-                    checked={store.listValuesVisible}
-                    onCheckedChange={store.toggleValues}
-                  />
-                  <Label
-                    htmlFor="list-values-visible"
-                    className="whitespace-nowrap text-[10px] text-muted-foreground"
+                <div className="ml-1 flex shrink-0 items-center border-l pl-2">
+                  <Button
+                    variant={store.listValuesVisible ? "secondary" : "ghost"}
+                    size="icon-sm"
+                    aria-label={
+                      store.listValuesVisible
+                        ? "隐藏全部 Value"
+                        : "显示全部 Value"
+                    }
+                    aria-pressed={store.listValuesVisible}
+                    title={
+                      store.listValuesVisible
+                        ? "隐藏全部 Value"
+                        : "显示全部 Value"
+                    }
+                    onClick={store.toggleValues}
                   >
-                    显示值
-                  </Label>
+                    {store.listValuesVisible ? <Eye /> : <EyeOff />}
+                  </Button>
                 </div>
                 <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={
-                    sort === "manual"
-                      ? "按 Key 排序"
-                      : sort === "key"
-                        ? "按更新时间排序"
-                        : "使用自定义排序"
-                  }
-                  title={
-                    sort === "manual"
-                      ? "当前为自定义排序，点击按 Key 排序"
-                      : sort === "key"
-                        ? "当前按 Key 排序，点击按更新时间排序"
-                        : "当前按更新时间排序，点击使用自定义排序"
-                  }
-                  disabled={ordering}
-                  className="ml-1 text-muted-foreground"
-                  onClick={() =>
-                    setSort((s) =>
-                      s === "manual"
-                        ? "key"
-                        : s === "key"
-                          ? "updated"
-                          : "manual",
-                    )
-                  }
-                >
-                  {sort === "manual" ? (
-                    <ListOrdered />
-                  ) : sort === "updated" ? (
-                    <ArrowUpDown />
-                  ) : (
-                    <ArrowDownAZ />
-                  )}
-                </Button>
-                <Button
                   variant={ordering ? "default" : "ghost"}
-                  size="sm"
-                  className="shrink-0 text-xs"
+                  size="icon-sm"
                   aria-label={ordering ? "保存排序" : "编辑排序"}
                   disabled={
                     readOnly ||
@@ -576,24 +710,24 @@ export function Workspace() {
                     dragging ||
                     (!ordering && (filtered.length < 2 || Boolean(store.query)))
                   }
-                  title={store.query ? "清除搜索后编辑排序" : undefined}
+                  title={
+                    store.query
+                      ? "清除搜索后编辑排序"
+                      : ordering
+                        ? "保存排序"
+                        : "排列记录"
+                  }
                   onClick={() => {
                     if (ordering)
                       void store
                         .save()
-                        .then(() => {
-                          if (!useVault.getState().orderDraft)
-                            setSort("manual");
-                        })
                         .catch((error) => toast.error(errorMessage(error)));
                     else {
                       store.startOrdering(orderedIds);
-                      setSort("manual");
                     }
                   }}
                 >
-                  {ordering ? <Save /> : <Pencil />}
-                  {ordering ? "保存排序" : "编辑"}
+                  {ordering ? <Save /> : <ListOrdered />}
                 </Button>
                 {ordering && (
                   <Button
@@ -607,12 +741,6 @@ export function Workspace() {
                   </Button>
                 )}
               </div>
-              {!ordering && selection.length === 0 && (
-                <div className="grid h-9 shrink-0 grid-cols-[minmax(0,1fr)_100px] items-center border-b bg-muted/25 px-5 text-[10px] font-medium tracking-wide text-muted-foreground">
-                  <span>KEY / 备注</span>
-                  <span className="text-right">VALUE</span>
-                </div>
-              )}
               {ordering && (
                 <div className="flex h-9 shrink-0 items-center gap-2 border-b bg-accent/40 px-4 text-[11px] text-muted-foreground">
                   <GripVertical className="size-3.5" />
@@ -622,41 +750,6 @@ export function Workspace() {
                       尚未保存
                     </span>
                   )}
-                </div>
-              )}
-              {selection.length > 0 && !ordering && (
-                <div className="flex h-9 shrink-0 items-center gap-1 border-b bg-accent/40 px-4 text-[11px]">
-                  <span className="mr-auto" role="status">
-                    已选择 {selection.length} 条记录
-                  </span>
-                  <Button
-                    variant="ghost"
-                    size="xs"
-                    disabled={
-                      readOnly || store.busy || snapshot.tables.length < 2
-                    }
-                    onClick={() => moveEntries()}
-                  >
-                    <FolderInput />
-                    移动
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="xs"
-                    disabled={readOnly || store.busy}
-                    onClick={() => deleteEntries()}
-                  >
-                    <Trash2 />
-                    删除
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon-xs"
-                    aria-label="取消选择"
-                    onClick={() => store.selectEntries([])}
-                  >
-                    <X />
-                  </Button>
                 </div>
               )}
               <DragDropProvider
@@ -671,8 +764,9 @@ export function Workspace() {
                   setDragging(false);
                 }}
               >
-                <ScrollArea
-                  className="min-h-0 flex-1 outline-none"
+                <div
+                  ref={listViewport}
+                  className="min-h-0 flex-1 overflow-auto outline-none"
                   tabIndex={0}
                   role="group"
                   aria-label="记录列表"
@@ -698,245 +792,324 @@ export function Workspace() {
                     }
                   }}
                 >
-                  {filtered.map((entry, index) => (
-                    <SortableRecord
-                      key={entry.id}
-                      id={entry.id}
-                      index={index}
-                      enabled={ordering}
-                      disabled={readOnly || store.busy}
-                    >
-                      {({ ref, handleRef, isDragSource }) => (
-                        <ContextMenu>
-                          <ContextMenuTrigger
-                            asChild
-                            onContextMenu={(event) => {
-                              if (ordering) {
-                                event.preventDefault();
-                                return;
-                              }
-                              if (!selectedIds.has(entry.id)) {
-                                store.selectEntries([entry.id]);
-                              }
-                            }}
-                          >
-                            <div
-                              ref={ref}
-                              className={`record-row flex h-[58px] w-full select-none items-center gap-2 border-b px-4 text-left transition-colors ${isDragSource ? "relative z-10 bg-accent shadow-lg" : selectedIds.has(entry.id) ? "bg-accent/80" : store.selectedEntry === entry.id ? "bg-muted/40" : "hover:bg-muted/40"}`}
-                            >
-                              {ordering ? (
-                                <Button
-                                  ref={handleRef}
-                                  variant="ghost"
-                                  size="icon-sm"
-                                  className="shrink-0 cursor-grab touch-none text-muted-foreground active:cursor-grabbing"
-                                  aria-label={`拖动排序：${entry.key}`}
-                                  title="拖动排序，或按空格后使用方向键调整"
-                                  disabled={readOnly || store.busy}
-                                >
-                                  <GripVertical className="size-4" />
-                                </Button>
-                              ) : (
-                                <Button
-                                  variant="ghost"
-                                  size="icon-sm"
-                                  className={`size-7 shrink-0 rounded-lg border ${selectedIds.has(entry.id) ? "border-foreground/15 bg-background" : "bg-muted/35"}`}
-                                  aria-label={`选择记录：${entry.key}`}
-                                  aria-pressed={selectedIds.has(entry.id)}
-                                  onClick={(event) =>
-                                    store.selectEntry(entry, {
-                                      additive:
-                                        !event.shiftKey ||
-                                        event.ctrlKey ||
-                                        event.metaKey,
-                                      range: event.shiftKey,
-                                      orderedIds,
-                                    })
+                  <Table
+                    aria-label="KV 记录"
+                    data-key-preference={keyWidth}
+                    data-value-preference={valueWidth}
+                    data-viewport-width={viewportWidth ?? undefined}
+                    containerClassName="overflow-visible"
+                    className="table-fixed border-separate border-spacing-0"
+                    style={
+                      {
+                        "--record-key-width": `${columns.key}px`,
+                        "--record-value-width": `${columns.value}px`,
+                      } as CSSProperties
+                    }
+                  >
+                    <colgroup>
+                      <col style={{ width: 52 }} />
+                      <col style={{ width: "var(--record-key-width)" }} />
+                      <col style={{ width: "var(--record-value-width)" }} />
+                      <col style={{ width: 72 }} />
+                    </colgroup>
+                    <RecordColumnHeader
+                      columns={columns}
+                      onKeyResize={resizeKey}
+                      onValueResize={resizeValue}
+                      selectionState={
+                        selectedVisibleCount === 0
+                          ? false
+                          : selectedVisibleCount === filtered.length
+                            ? true
+                            : "indeterminate"
+                      }
+                      selectionDisabled={ordering || filtered.length === 0}
+                      onSelectAll={(checked) =>
+                        store.selectEntries(checked ? orderedIds : [])
+                      }
+                    />
+                    <TableBody>
+                      {filtered.map((entry, index) => (
+                        <SortableRecord
+                          key={entry.id}
+                          id={entry.id}
+                          index={index}
+                          enabled={ordering}
+                          disabled={readOnly || store.busy}
+                        >
+                          {({ ref, handleRef, isDragSource }) => (
+                            <ContextMenu>
+                              <ContextMenuTrigger
+                                asChild
+                                onContextMenu={(event) => {
+                                  if (ordering) {
+                                    event.preventDefault();
+                                    return;
                                   }
-                                >
-                                  {selectedIds.has(entry.id) ? (
-                                    <Check className="size-3.5" />
-                                  ) : (
-                                    <KeyRound
-                                      className="size-3.5 text-muted-foreground"
-                                      strokeWidth={1.7}
-                                    />
-                                  )}
-                                </Button>
-                              )}
-                              <button
-                                className="flex min-w-0 flex-1 items-center gap-2.5 self-stretch py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-                                disabled={ordering}
-                                onClick={() => store.openEntry(entry)}
+                                  if (!selectedIds.has(entry.id)) {
+                                    store.selectEntries([entry.id]);
+                                  }
+                                }}
                               >
-                                <div className="min-w-0 flex-1">
-                                  <p className="mono truncate text-xs font-medium">
-                                    {entry.key}
-                                  </p>
-                                  <p className="mt-0.5 truncate text-[10px] text-muted-foreground">
-                                    {entry.notes ||
-                                      (store.selectedTable
-                                        ? "暂无备注"
-                                        : (snapshot.tables.find(
-                                            (t) => t.id === entry.tableId,
-                                          )?.name ?? "待解决的表"))}
-                                  </p>
-                                </div>
-                                <div className="w-24 shrink-0 text-right">
-                                  <p
-                                    className={`mono truncate text-xs ${store.listValuesVisible ? "text-foreground" : "tracking-[.15em] text-muted-foreground/60"}`}
-                                    aria-label={
-                                      store.listValuesVisible
-                                        ? undefined
-                                        : "已隐藏的 Value"
-                                    }
-                                  >
-                                    {store.listValuesVisible
-                                      ? entry.value || "（空）"
-                                      : "••••••••"}
-                                  </p>
-                                  <p className="mt-0.5 text-[9px] text-muted-foreground/65">
-                                    {date(entry.updatedAt)}
-                                  </p>
-                                </div>
-                              </button>
-                              <div className="flex shrink-0 gap-0.5 text-muted-foreground">
-                                <Button
-                                  variant="ghost"
-                                  size="icon-xs"
-                                  aria-label={`复制 Key：${entry.key}`}
-                                  title="复制 Key"
-                                  onClick={() =>
-                                    void copyEntry(entry.id, "key")
+                                <TableRow
+                                  ref={ref}
+                                  data-state={
+                                    selectedIds.has(entry.id)
+                                      ? "selected"
+                                      : undefined
                                   }
+                                  className={`record-row h-[58px] select-none text-left ${isDragSource ? "relative z-20 bg-accent shadow-lg" : selectedIds.has(entry.id) ? "bg-accent/80" : store.selectedEntry === entry.id ? "bg-muted/40" : "hover:bg-muted/40"}`}
                                 >
-                                  <KeyRound className="size-3" />
-                                </Button>
-                                <Button
-                                  variant="ghost"
-                                  size="icon-xs"
-                                  aria-label={`复制 Value：${entry.key}`}
-                                  title="复制 Value"
-                                  onClick={() =>
-                                    void copyEntry(entry.id, "value")
-                                  }
-                                >
-                                  <Copy className="size-3" />
-                                </Button>
-                              </div>
-                            </div>
-                          </ContextMenuTrigger>
-                          <ContextMenuContent
-                            className="w-48"
-                            onKeyDown={(event) => event.stopPropagation()}
-                          >
-                            <ContextMenuLabel>
-                              {selection.length > 1
-                                ? `已选择 ${selection.length} 条记录`
-                                : entry.key}
-                            </ContextMenuLabel>
-                            <ContextMenuSeparator />
-                            {selection.length <= 1 && (
-                              <>
+                                  <TableCell className="border-b py-0 pl-4 pr-2">
+                                    {ordering ? (
+                                      <Button
+                                        ref={handleRef}
+                                        variant="ghost"
+                                        size="icon-sm"
+                                        className="shrink-0 cursor-grab touch-none text-muted-foreground active:cursor-grabbing"
+                                        aria-label={`拖动排序：${entry.key}`}
+                                        title="拖动排序，或按空格后使用方向键调整"
+                                        disabled={readOnly || store.busy}
+                                      >
+                                        <GripVertical className="size-4" />
+                                      </Button>
+                                    ) : (
+                                      <Button
+                                        variant="ghost"
+                                        size="icon-sm"
+                                        className={`size-7 shrink-0 rounded-lg border ${selectedIds.has(entry.id) ? "border-foreground/15 bg-background" : "bg-muted/35"}`}
+                                        aria-label={`选择记录：${entry.key}`}
+                                        aria-pressed={selectedIds.has(entry.id)}
+                                        onClick={(event) =>
+                                          store.selectEntry(entry, {
+                                            additive:
+                                              !event.shiftKey ||
+                                              event.ctrlKey ||
+                                              event.metaKey,
+                                            range: event.shiftKey,
+                                            orderedIds,
+                                          })
+                                        }
+                                      >
+                                        {selectedIds.has(entry.id) ? (
+                                          <Check className="size-3.5" />
+                                        ) : (
+                                          <KeyRound
+                                            className="size-3.5 text-muted-foreground"
+                                            strokeWidth={1.7}
+                                          />
+                                        )}
+                                      </Button>
+                                    )}
+                                  </TableCell>
+                                  <TableCell className="overflow-hidden border-b px-2 py-0">
+                                    <button
+                                      className="block h-[58px] w-full min-w-0 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                                      disabled={ordering}
+                                      onClick={() => store.openEntry(entry)}
+                                    >
+                                      <div className="min-w-0 flex-1">
+                                        <p className="mono truncate text-xs font-medium">
+                                          {entry.key}
+                                        </p>
+                                        <p className="mt-0.5 truncate text-[10px] text-muted-foreground">
+                                          {entry.notes ||
+                                            (store.selectedTable
+                                              ? "暂无备注"
+                                              : (snapshot.tables.find(
+                                                  (t) => t.id === entry.tableId,
+                                                )?.name ?? "待解决的表"))}
+                                        </p>
+                                      </div>
+                                    </button>
+                                  </TableCell>
+                                  <TableCell className="overflow-hidden border-b px-2 py-0">
+                                    <button
+                                      className="block h-[58px] w-full min-w-0 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                                      aria-label={`打开记录：${entry.key}`}
+                                      disabled={ordering}
+                                      onClick={() => store.openEntry(entry)}
+                                    >
+                                      <p
+                                        className={`mono truncate text-xs ${isValueVisible(entry.id) ? "text-foreground" : "tracking-[.15em] text-muted-foreground/60"}`}
+                                        aria-label={
+                                          isValueVisible(entry.id)
+                                            ? undefined
+                                            : "已隐藏的 Value"
+                                        }
+                                      >
+                                        {isValueVisible(entry.id)
+                                          ? entry.value || "（空）"
+                                          : "••••••••"}
+                                      </p>
+                                      <p className="mt-0.5 truncate text-[9px] text-muted-foreground/65">
+                                        {date(entry.updatedAt)}
+                                      </p>
+                                    </button>
+                                  </TableCell>
+                                  <TableCell className="border-b py-0 pl-1.5 pr-4 text-right">
+                                    <div className="flex shrink-0 justify-end gap-0.5 text-muted-foreground">
+                                      <Button
+                                        variant="ghost"
+                                        size="icon-xs"
+                                        aria-label={`${isValueVisible(entry.id) ? "隐藏" : "显示"} Value：${entry.key}`}
+                                        aria-pressed={isValueVisible(entry.id)}
+                                        title={
+                                          isValueVisible(entry.id)
+                                            ? "隐藏此项 Value"
+                                            : "显示此项 Value"
+                                        }
+                                        onClick={() =>
+                                          store.toggleEntryValue(entry.id)
+                                        }
+                                      >
+                                        {isValueVisible(entry.id) ? (
+                                          <Eye className="size-3" />
+                                        ) : (
+                                          <EyeOff className="size-3" />
+                                        )}
+                                      </Button>
+                                      <Button
+                                        variant="ghost"
+                                        size="icon-xs"
+                                        aria-label={`复制 Value：${entry.key}`}
+                                        title="复制 Value"
+                                        onClick={() =>
+                                          void copyEntry(entry.id, "value")
+                                        }
+                                      >
+                                        <Copy className="size-3" />
+                                      </Button>
+                                    </div>
+                                  </TableCell>
+                                </TableRow>
+                              </ContextMenuTrigger>
+                              <ContextMenuContent
+                                className="w-48"
+                                onKeyDown={(event) => event.stopPropagation()}
+                              >
+                                <ContextMenuLabel>
+                                  {selection.length > 1
+                                    ? `已选择 ${selection.length} 条记录`
+                                    : entry.key}
+                                </ContextMenuLabel>
+                                <ContextMenuSeparator />
+                                {selection.length <= 1 && (
+                                  <>
+                                    <ContextMenuItem
+                                      disabled={readOnly || store.busy}
+                                      onSelect={() => store.openEntry(entry)}
+                                    >
+                                      <Pencil />
+                                      编辑记录
+                                    </ContextMenuItem>
+                                    <ContextMenuItem
+                                      onSelect={() =>
+                                        void copyEntry(entry.id, "key")
+                                      }
+                                    >
+                                      <KeyRound />
+                                      复制 Key
+                                    </ContextMenuItem>
+                                    <ContextMenuItem
+                                      onSelect={() =>
+                                        void copyEntry(entry.id, "value")
+                                      }
+                                    >
+                                      <Copy />
+                                      复制 Value
+                                    </ContextMenuItem>
+                                    <ContextMenuSeparator />
+                                  </>
+                                )}
                                 <ContextMenuItem
+                                  disabled={
+                                    readOnly ||
+                                    store.busy ||
+                                    snapshot.tables.length < 2
+                                  }
+                                  onSelect={() => moveEntries()}
+                                >
+                                  <FolderInput />
+                                  移动到数据表…
+                                </ContextMenuItem>
+                                <ContextMenuItem
+                                  variant="destructive"
                                   disabled={readOnly || store.busy}
-                                  onSelect={() => store.openEntry(entry)}
+                                  onSelect={() => deleteEntries()}
                                 >
-                                  <Pencil />
-                                  编辑记录
-                                </ContextMenuItem>
-                                <ContextMenuItem
-                                  onSelect={() =>
-                                    void copyEntry(entry.id, "key")
-                                  }
-                                >
-                                  <KeyRound />
-                                  复制 Key
-                                </ContextMenuItem>
-                                <ContextMenuItem
-                                  onSelect={() =>
-                                    void copyEntry(entry.id, "value")
-                                  }
-                                >
-                                  <Copy />
-                                  复制 Value
+                                  <Trash2 />
+                                  {selection.length > 1
+                                    ? "删除所选记录…"
+                                    : "删除记录…"}
                                 </ContextMenuItem>
                                 <ContextMenuSeparator />
-                              </>
-                            )}
-                            <ContextMenuItem
-                              disabled={
-                                readOnly ||
-                                store.busy ||
-                                snapshot.tables.length < 2
-                              }
-                              onSelect={() => moveEntries()}
-                            >
-                              <FolderInput />
-                              移动到数据表…
-                            </ContextMenuItem>
-                            <ContextMenuItem
-                              variant="destructive"
-                              disabled={readOnly || store.busy}
-                              onSelect={() => deleteEntries()}
-                            >
-                              <Trash2 />
-                              {selection.length > 1
-                                ? "删除所选记录…"
-                                : "删除记录…"}
-                            </ContextMenuItem>
-                            <ContextMenuSeparator />
-                            <ContextMenuItem
-                              onSelect={() => store.selectEntries(orderedIds)}
-                            >
-                              全选当前列表
-                            </ContextMenuItem>
-                            <ContextMenuItem
-                              onSelect={() => store.selectEntries([])}
-                            >
-                              取消选择
-                            </ContextMenuItem>
-                          </ContextMenuContent>
-                        </ContextMenu>
+                                <ContextMenuItem
+                                  onSelect={() =>
+                                    store.selectEntries(orderedIds)
+                                  }
+                                >
+                                  全选当前列表
+                                </ContextMenuItem>
+                                <ContextMenuItem
+                                  onSelect={() => store.selectEntries([])}
+                                >
+                                  取消选择
+                                </ContextMenuItem>
+                              </ContextMenuContent>
+                            </ContextMenu>
+                          )}
+                        </SortableRecord>
+                      ))}
+                      {!filtered.length && (
+                        <TableRow>
+                          <TableCell
+                            colSpan={4}
+                            className="whitespace-normal p-0"
+                          >
+                            <div className="flex flex-col items-center px-7 py-20 text-center">
+                              <div className="mb-4 flex size-12 items-center justify-center rounded-2xl border bg-muted/25">
+                                {store.query ? (
+                                  <Search className="size-5 text-muted-foreground" />
+                                ) : (
+                                  <FileKey2 className="size-5 text-muted-foreground" />
+                                )}
+                              </div>
+                              <p className="text-sm font-medium">
+                                {store.query
+                                  ? "没有找到相关记录"
+                                  : "这里还很安静"}
+                              </p>
+                              <p className="mt-2 max-w-[230px] text-xs leading-6 text-muted-foreground">
+                                {store.query
+                                  ? "试试其他关键词，搜索包含所有解锁的内容。"
+                                  : "保存你的第一条 Key，把重要的信息留在这里。"}
+                              </p>
+                              {!store.query && (
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="mt-5 text-xs"
+                                  disabled={readOnly}
+                                  onClick={() =>
+                                    snapshot.tables.length
+                                      ? store.newEntry()
+                                      : setTableDialog({ name: "" })
+                                  }
+                                >
+                                  <Plus />
+                                  {snapshot.tables.length
+                                    ? "新建记录"
+                                    : "新建数据表"}
+                                </Button>
+                              )}
+                            </div>
+                          </TableCell>
+                        </TableRow>
                       )}
-                    </SortableRecord>
-                  ))}
-                  {!filtered.length && (
-                    <div className="flex flex-col items-center px-7 py-20 text-center">
-                      <div className="mb-4 flex size-12 items-center justify-center rounded-2xl border bg-muted/25">
-                        {store.query ? (
-                          <Search className="size-5 text-muted-foreground" />
-                        ) : (
-                          <FileKey2 className="size-5 text-muted-foreground" />
-                        )}
-                      </div>
-                      <p className="text-sm font-medium">
-                        {store.query ? "没有找到相关记录" : "这里还很安静"}
-                      </p>
-                      <p className="mt-2 max-w-[230px] text-xs leading-6 text-muted-foreground">
-                        {store.query
-                          ? "试试其他关键词，搜索包含所有解锁的内容。"
-                          : "保存你的第一条 Key，把重要的信息留在这里。"}
-                      </p>
-                      {!store.query && (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="mt-5 text-xs"
-                          disabled={readOnly}
-                          onClick={() =>
-                            snapshot.tables.length
-                              ? store.newEntry()
-                              : setTableDialog({ name: "" })
-                          }
-                        >
-                          <Plus />
-                          {snapshot.tables.length ? "新建记录" : "新建数据表"}
-                        </Button>
-                      )}
-                    </div>
-                  )}
-                </ScrollArea>
+                    </TableBody>
+                  </Table>
+                </div>
               </DragDropProvider>
               <div className="flex h-9 shrink-0 items-center justify-between border-t px-5 text-[10px] text-muted-foreground">
                 <span>
@@ -944,12 +1117,16 @@ export function Workspace() {
                   {selection.length ? ` · 已选择 ${selection.length} 条` : ""}
                 </span>
                 <span className="flex items-center gap-1">
-                  {store.listValuesVisible ? (
+                  {visibleValueCount ? (
                     <Eye className="size-3" />
                   ) : (
                     <EyeOff className="size-3" />
                   )}
-                  {store.listValuesVisible ? "Value 已显示" : "Value 已隐藏"}
+                  {visibleValueCount === 0
+                    ? "Value 已隐藏"
+                    : visibleValueCount === filtered.length
+                      ? "Value 已显示"
+                      : `已显示 ${visibleValueCount} 个 Value`}
                 </span>
               </div>
             </div>
@@ -1427,6 +1604,208 @@ export function Workspace() {
         </AlertDialogContent>
       </AlertDialog>
     </div>
+  );
+}
+
+function RecordColumnHeader({
+  columns,
+  onKeyResize,
+  onValueResize,
+  selectionState,
+  selectionDisabled,
+  onSelectAll,
+}: {
+  columns: RecordColumnWidths;
+  onKeyResize: (width: number) => void;
+  onValueResize: (width: number) => void;
+  selectionState: boolean | "indeterminate";
+  selectionDisabled: boolean;
+  onSelectAll: (checked: boolean) => void;
+}) {
+  return (
+    <TableHeader className="sticky top-0 z-10 bg-background">
+      <TableRow className="bg-muted/25 hover:bg-muted/25">
+        <TableHead scope="col" className="h-9 border-b pl-4 pr-2">
+          <div className="flex size-7 items-center justify-center">
+            <Checkbox
+              aria-label="全选当前列表"
+              title={
+                selectionState === true ? "取消全选当前列表" : "全选当前列表"
+              }
+              checked={selectionState}
+              disabled={selectionDisabled}
+              onCheckedChange={(checked) => onSelectAll(checked === true)}
+            />
+          </div>
+        </TableHead>
+        <TableHead
+          scope="col"
+          className="relative h-9 border-b px-2 text-[10px] tracking-wide text-muted-foreground"
+        >
+          <span className="block truncate pr-1">KEY / 备注</span>
+          <ColumnResizeHandle
+            column="key"
+            width={columns.key}
+            minWidth={columns.minKey}
+            defaultWidth={200}
+            onResize={onKeyResize}
+          />
+        </TableHead>
+        <TableHead
+          scope="col"
+          className="relative h-9 border-b px-2 text-[10px] tracking-wide text-muted-foreground"
+        >
+          <span className="block truncate pr-1">VALUE</span>
+          <ColumnResizeHandle
+            column="value"
+            width={columns.value}
+            minWidth={columns.minValue}
+            defaultWidth={180}
+            onResize={onValueResize}
+          />
+        </TableHead>
+        <TableHead scope="col" className="h-9 border-b px-0 text-right">
+          <span className="sr-only">操作</span>
+        </TableHead>
+      </TableRow>
+    </TableHeader>
+  );
+}
+
+function ColumnResizeHandle({
+  column,
+  width,
+  minWidth,
+  defaultWidth,
+  onResize,
+}: {
+  column: "key" | "value";
+  width: number;
+  minWidth: number;
+  defaultWidth: number;
+  onResize: (width: number) => void;
+}) {
+  const drag = useRef<{
+    table: HTMLTableElement;
+    pointerId: number;
+    startX: number;
+    startWidth: number;
+    preferredWidth: number;
+    width: number;
+    moved: boolean;
+  } | null>(null);
+  const preview = (nextWidth: number, restore = false) => {
+    const current = drag.current;
+    if (!current) return;
+    const viewport = Number(current.table.dataset.viewportWidth ?? Infinity);
+    const available = Math.max(0, viewport - 124);
+    const key = Number(current.table.dataset.keyPreference);
+    const value = Number(current.table.dataset.valuePreference);
+    const sizes = fitRecordColumns(
+      restore
+        ? key
+        : column === "key"
+          ? nextWidth
+          : Number.isFinite(available)
+            ? available - nextWidth
+            : key,
+      restore
+        ? value
+        : column === "value"
+          ? nextWidth
+          : Number.isFinite(available)
+            ? available - nextWidth
+            : value,
+      viewport,
+    );
+    current.width = sizes[column];
+    // Update the shared <col> immediately; rendering every record during a drag causes lag.
+    for (const name of ["key", "value"] as const) {
+      current.table.style.setProperty(
+        `--record-${name}-width`,
+        `${sizes[name]}px`,
+      );
+      const separator = current.table.querySelector(
+        `[data-record-column="${name}"]`,
+      );
+      separator?.setAttribute("aria-valuenow", String(sizes[name]));
+      separator?.setAttribute("aria-valuetext", `${sizes[name]} 像素`);
+    }
+  };
+  const finish = (handle: HTMLDivElement, cancel = false) => {
+    const current = drag.current;
+    if (!current) return;
+    if (cancel) preview(current.preferredWidth, true);
+    drag.current = null;
+    if (!cancel && current.moved) onResize(current.width);
+    if (handle.hasPointerCapture(current.pointerId))
+      handle.releasePointerCapture(current.pointerId);
+  };
+  return (
+    <div
+      role="separator"
+      data-record-column={column}
+      tabIndex={0}
+      aria-label={`调整 ${column === "key" ? "Key" : "Value"} 列宽`}
+      aria-orientation="vertical"
+      aria-valuemin={minWidth}
+      aria-valuenow={width}
+      aria-valuetext={`${width} 像素`}
+      title="拖动调整列宽，方向键微调，双击恢复默认宽度"
+      className="absolute right-0 inset-y-0 z-10 flex w-2 touch-none select-none items-center justify-center cursor-col-resize outline-none after:h-4 after:w-px after:bg-border hover:after:bg-foreground/60 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+      onPointerDown={(event) => {
+        if (event.button !== 0) return;
+        const table = event.currentTarget.closest("table");
+        if (!table) return;
+        event.preventDefault();
+        event.stopPropagation();
+        event.currentTarget.setPointerCapture(event.pointerId);
+        drag.current = {
+          table,
+          pointerId: event.pointerId,
+          startX: event.clientX,
+          startWidth: width,
+          preferredWidth: Number(
+            column === "key"
+              ? table.dataset.keyPreference
+              : table.dataset.valuePreference,
+          ),
+          width,
+          moved: false,
+        };
+      }}
+      onPointerMove={(event) => {
+        const current = drag.current;
+        if (!current || current.pointerId !== event.pointerId) return;
+        current.moved ||= event.clientX !== current.startX;
+        preview(current.startWidth + event.clientX - current.startX);
+      }}
+      onPointerUp={(event) => {
+        if (drag.current?.pointerId !== event.pointerId) return;
+        finish(event.currentTarget);
+      }}
+      onPointerCancel={(event) => {
+        finish(event.currentTarget, true);
+      }}
+      onLostPointerCapture={(event) => {
+        finish(event.currentTarget);
+      }}
+      onDoubleClick={() => onResize(defaultWidth)}
+      onKeyDown={(event) => {
+        if (!["ArrowLeft", "ArrowRight", "Home"].includes(event.key)) return;
+        event.preventDefault();
+        onResize(
+          Math.max(
+            minWidth,
+            event.key === "Home"
+              ? minWidth
+              : width +
+                  (event.key === "ArrowRight" ? 1 : -1) *
+                    (event.shiftKey ? 10 : 1),
+          ),
+        );
+      }}
+    />
   );
 }
 

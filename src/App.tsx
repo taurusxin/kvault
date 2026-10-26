@@ -38,6 +38,12 @@ function App() {
   const orderDirty = useVault((s) => s.orderDirty);
   const [loadError, setLoadError] = useState("");
   useEffect(() => {
+    const suppressNativeMenu = (event: MouseEvent) => event.preventDefault();
+    document.addEventListener("contextmenu", suppressNativeMenu);
+    return () =>
+      document.removeEventListener("contextmenu", suppressNativeMenu);
+  }, []);
+  useEffect(() => {
     void useVault
       .getState()
       .initialize()

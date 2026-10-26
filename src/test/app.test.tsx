@@ -567,11 +567,16 @@ describe("保险库界面与会话", () => {
     await screen.findByText("无法保存关闭设置");
     expect(useVault.getState().closeSettings.askBeforeClose).toBe(true);
   });
-  it("支持 Ctrl/Cmd 增减、Shift 按当前排序连续选择，以及筛选后的全选", async () => {
-    useVault.getState().accept(selectionFixture(), true);
+  it("支持 Ctrl/Cmd 增减、Shift 按当前顺序连续选择，以及筛选后的全选", async () => {
+    const snapshot = selectionFixture();
+    snapshot.entries.forEach((entry) => {
+      entry.sortOrder = ["alpha", "beta", "delta", "gamma"].indexOf(entry.id);
+    });
+    useVault.getState().accept(snapshot, true);
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "按 Key 排序" }));
-    fireEvent.click(screen.getByRole("button", { name: "选择记录：beta" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "选择记录：beta" }),
+    );
     fireEvent.click(screen.getByRole("button", { name: "选择记录：gamma" }), {
       ctrlKey: true,
     });
@@ -620,6 +625,42 @@ describe("保险库界面与会话", () => {
       key: "Escape",
     });
     expect(useVault.getState().selectedIds).toEqual([]);
+  });
+  it("表头全选支持半选、取消、筛选范围，并在排列或空列表时禁用", async () => {
+    useVault.getState().accept(selectionFixture(), true);
+    render(<App />);
+    const selectAll = await screen.findByRole("checkbox", {
+      name: "全选当前列表",
+    });
+    expect(selectAll).not.toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "选择记录：alpha" }));
+    expect(selectAll).toBePartiallyChecked();
+    fireEvent.click(selectAll);
+    expect(selectAll).toBeChecked();
+    expect(useVault.getState().selectedIds).toHaveLength(4);
+    expect(useVault.getState().selectedEntry).toBeNull();
+    fireEvent.click(selectAll);
+    expect(selectAll).not.toBeChecked();
+    expect(useVault.getState().selectedIds).toEqual([]);
+    fireEvent.change(screen.getByRole("textbox", { name: "搜索记录" }), {
+      target: { value: "beta" },
+    });
+    fireEvent.click(selectAll);
+    expect(selectAll).toBeChecked();
+    expect(useVault.getState().selectedIds).toEqual(["beta"]);
+    fireEvent.click(screen.getByRole("button", { name: "清除搜索" }));
+    expect(selectAll).not.toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "编辑排序" }));
+    expect(selectAll).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "取消排序" }));
+    expect(selectAll).not.toBeDisabled();
+    act(() =>
+      useVault
+        .getState()
+        .accept({ ...selectionFixture(), revision: 2, entries: [] }),
+    );
+    expect(selectAll).toBeDisabled();
+    expect(selectAll).not.toBeChecked();
   });
   it("右键保留多选，移动一次性提交，右键未选项目改为单选并可复制", async () => {
     const snapshot = selectionFixture();
@@ -850,7 +891,7 @@ describe("保险库界面与会话", () => {
       screen.queryByRole("button", { name: "显示 Value" }),
     ).not.toBeInTheDocument();
   });
-  it("列表支持直接复制 Key 和 Value，以及统一显隐且锁定重置", async () => {
+  it("列表支持复制 Value、单项显隐、全局图标显隐且锁定重置", async () => {
     useVault.getState().accept(fixture(), true);
     render(<App />);
     fireEvent.click(
@@ -865,30 +906,250 @@ describe("保险库界面与会话", () => {
       }),
     );
     expect(useVault.getState().selectedEntry).toBeNull();
+    expect(screen.queryByText("private-value-123")).not.toBeInTheDocument();
     fireEvent.click(
-      screen.getByRole("button", { name: "复制 Key：api.production.token" }),
+      screen.getByRole("button", { name: "显示 Value：api.production.token" }),
     );
-    await waitFor(() =>
-      expect(invoke).toHaveBeenCalledWith("copy_key", {
-        sessionId: 1,
-        entryId: "entry",
-      }),
+    expect(screen.getByText("private-value-123")).toBeInTheDocument();
+    expect(useVault.getState().selectedEntry).toBeNull();
+    expect(invoke).not.toHaveBeenCalledWith("copy_key", expect.anything());
+    fireEvent.click(
+      screen.getByRole("button", { name: "隐藏 Value：api.production.token" }),
     );
     expect(screen.queryByText("private-value-123")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("switch", { name: "显示全部 Value" }));
+    const showAll = screen.getByRole("button", { name: "显示全部 Value" });
+    expect(showAll).toHaveTextContent("");
+    expect(showAll).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(showAll);
     expect(screen.getByText("private-value-123")).toBeInTheDocument();
     fireEvent.click(screen.getByText("api.production.token"));
     expect(screen.getByDisplayValue("private-value-123")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("switch", { name: "显示全部 Value" }));
+    fireEvent.click(screen.getByRole("button", { name: "隐藏全部 Value" }));
     expect(
       screen.queryByDisplayValue("private-value-123"),
     ).not.toBeInTheDocument();
     expect(screen.queryByText("private-value-123")).not.toBeInTheDocument();
     act(() => {
-      useVault.getState().toggleValues();
+      useVault.getState().toggleEntryValue("entry");
       useVault.getState().clear();
     });
     expect(useVault.getState().listValuesVisible).toBe(false);
+    expect(useVault.getState().listValueOverrides).toEqual({});
+  });
+  it("单项显隐相互独立，全局显隐清除单项覆盖，排列按钮只显示图标", async () => {
+    const snapshot = fixture();
+    snapshot.entries.push({
+      ...snapshot.entries[0],
+      id: "second",
+      key: "second.key",
+      value: "second-secret",
+    });
+    useVault.getState().accept(snapshot, true);
+    render(<App />);
+    const arrange = await screen.findByRole("button", { name: "编辑排序" });
+    expect(arrange).toHaveTextContent("");
+    expect(
+      screen.queryByRole("button", { name: "按 Key 排序" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "显示 Value：api.production.token" }),
+    );
+    expect(screen.getByText("private-value-123")).toBeInTheDocument();
+    expect(screen.queryByText("second-secret")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "显示全部 Value" }));
+    expect(screen.getByText("second-secret")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "隐藏 Value：api.production.token" }),
+    );
+    expect(screen.queryByText("private-value-123")).not.toBeInTheDocument();
+    expect(screen.getByText("second-secret")).toBeInTheDocument();
+    expect(screen.getByText("已显示 1 个 Value")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "隐藏全部 Value" }));
+    expect(screen.queryByText("second-secret")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "显示全部 Value" }));
+    expect(screen.getByText("private-value-123")).toBeInTheDocument();
+    expect(screen.getByText("second-secret")).toBeInTheDocument();
+    fireEvent.click(arrange);
+    expect(screen.getByRole("button", { name: "保存排序" })).toHaveTextContent(
+      "",
+    );
+  });
+  it("批量操作从顶部已选按钮打开，支持删除与取消选择", async () => {
+    useVault.getState().accept(selectionFixture(), true);
+    render(<App />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "选择记录：alpha" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "选择记录：beta" }));
+    fireEvent.keyDown(screen.getByRole("button", { name: "已选择 2 条" }), {
+      key: "Enter",
+    });
+    fireEvent.click(
+      await screen.findByRole("menuitem", { name: "删除所选记录…" }),
+    );
+    expect(screen.getByText("删除选中的 2 条记录？")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    fireEvent.keyDown(screen.getByRole("button", { name: "已选择 2 条" }), {
+      key: "Enter",
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "取消选择" }));
+    expect(useVault.getState().selectedIds).toEqual([]);
+    expect(
+      screen.queryByRole("button", { name: /已选择/ }),
+    ).not.toBeInTheDocument();
+  });
+  it("全局禁用原生右键菜单，记录的自定义右键仍可用", async () => {
+    useVault.getState().accept(fixture(), true);
+    render(<App />);
+    const title = await screen.findByRole("heading", { name: "全部记录" });
+    expect(fireEvent.contextMenu(title)).toBe(false);
+    expect(
+      fireEvent.contextMenu(screen.getByRole("textbox", { name: "搜索记录" })),
+    ).toBe(false);
+    fireEvent.contextMenu(screen.getByText("api.production.token"));
+    expect(
+      await screen.findByRole("menuitem", { name: "复制 Key" }),
+    ).toBeInTheDocument();
+  });
+  it("数据表排序立即提交并保持正在编辑的草稿", async () => {
+    const snapshot = selectionFixture();
+    useVault.getState().accept(snapshot, true);
+    useVault.getState().openEntry(snapshot.entries[0]);
+    useVault.getState().edit({ notes: "unsaved notes" });
+    vi.mocked(invoke).mockResolvedValueOnce({
+      ...snapshot,
+      revision: 2,
+      tables: [...snapshot.tables].reverse(),
+    });
+    await useVault.getState().reorderTable("table", 1);
+    expect(invoke).toHaveBeenCalledWith("mutate_vault", {
+      sessionId: 1,
+      action: { type: "reorderTables", ids: ["target", "table"] },
+    });
+    expect(
+      useVault.getState().snapshot?.tables.map((table) => table.id),
+    ).toEqual(["target", "table"]);
+    expect(useVault.getState().draft?.notes).toBe("unsaved notes");
+    expect(useVault.getState().dirty).toBe(true);
+    vi.mocked(invoke).mockClear();
+    await useVault.getState().reorderTable("missing", 0);
+    await useVault.getState().reorderTable("target", 0);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+  it("使用真实表格，列宽按像素连续调整，支持取消、键盘微调与恢复默认", async () => {
+    useVault.getState().accept(fixture(), true);
+    render(<App />);
+    const table = await screen.findByRole("table", { name: "KV 记录" });
+    expect(table.tagName).toBe("TABLE");
+    expect(within(table).getAllByRole("columnheader")).toHaveLength(4);
+    expect(within(table).getAllByRole("row")).toHaveLength(2);
+    expect(within(table).getAllByRole("cell")).toHaveLength(4);
+    const handle = await screen.findByRole("separator", {
+      name: "调整 Value 列宽",
+    });
+    const pointer = (type: string, clientX: number, target = handle) => {
+      const event = new MouseEvent(type, { bubbles: true, button: 0, clientX });
+      Object.defineProperty(event, "pointerId", { value: 1 });
+      Object.defineProperty(event, "clientX", { value: clientX });
+      fireEvent(target, event);
+    };
+    pointer("pointerdown", 100);
+    pointer("pointermove", 100.25);
+    expect(table.style.getPropertyValue("--record-value-width")).toBe(
+      "180.25px",
+    );
+    pointer("pointermove", 100.5);
+    expect(table.style.getPropertyValue("--record-value-width")).toBe(
+      "180.5px",
+    );
+    pointer("pointerup", 100.5);
+    pointer("pointermove", 200);
+    expect(handle).toHaveAttribute("aria-valuenow", "180.5");
+    fireEvent.keyDown(handle, { key: "ArrowRight" });
+    expect(handle).toHaveAttribute("aria-valuenow", "181.5");
+    fireEvent.keyDown(handle, { key: "ArrowLeft", shiftKey: true });
+    expect(handle).toHaveAttribute("aria-valuenow", "171.5");
+    pointer("pointerdown", 100);
+    pointer("pointermove", 1000);
+    expect(handle).toHaveAttribute("aria-valuenow", "1071.5");
+    pointer("pointercancel", 1000);
+    expect(table.style.getPropertyValue("--record-value-width")).toBe(
+      "171.5px",
+    );
+    pointer("pointerdown", 100);
+    pointer("pointermove", 1000);
+    pointer("pointerup", 1000);
+    fireEvent.click(screen.getByRole("button", { name: "显示全部 Value" }));
+    expect(table.style.getPropertyValue("--record-value-width")).toBe(
+      "1071.5px",
+    );
+    fireEvent.keyDown(handle, { key: "Home" });
+    expect(handle).toHaveAttribute("aria-valuenow", "80");
+    fireEvent.doubleClick(handle);
+    expect(handle).toHaveAttribute("aria-valuenow", "180");
+    const keyHandle = screen.getByRole("separator", { name: "调整 Key 列宽" });
+    pointer("pointerdown", 100, keyHandle);
+    pointer("pointermove", 120.5, keyHandle);
+    pointer("pointerup", 120.5, keyHandle);
+    expect(table.style.getPropertyValue("--record-key-width")).toBe("220.5px");
+    expect(useVault.getState().selectedEntry).toBeNull();
+  });
+  it("面板变窄先收缩 Value 再收缩 Key，为操作列保留空间，放大恢复手动列宽", async () => {
+    const observers = new Map<Element, (width: number) => void>();
+    const OriginalResizeObserver = globalThis.ResizeObserver;
+    globalThis.ResizeObserver = class {
+      private targets = new Set<Element>();
+      constructor(private callback: ResizeObserverCallback) {}
+      observe(target: Element) {
+        this.targets.add(target);
+        observers.set(target, (width) =>
+          this.callback(
+            [{ target, contentRect: { width } } as ResizeObserverEntry],
+            this,
+          ),
+        );
+      }
+      unobserve(target: Element) {
+        this.targets.delete(target);
+        observers.delete(target);
+      }
+      disconnect() {
+        this.targets.forEach((target) => observers.delete(target));
+      }
+    };
+    try {
+      useVault.getState().accept(fixture(), true);
+      render(<App />);
+      const viewport = await screen.findByRole("group", { name: "记录列表" });
+      const table = screen.getByRole("table", { name: "KV 记录" });
+      const resize = (width: number) =>
+        act(() => observers.get(viewport)!(width));
+      const width = (column: "key" | "value") =>
+        parseFloat(table.style.getPropertyValue(`--record-${column}-width`));
+      resize(460.5);
+      expect(width("key")).toBe(200);
+      expect(width("value")).toBe(136.5);
+      resize(340);
+      expect(width("key")).toBe(136);
+      expect(width("value")).toBe(80);
+      resize(240);
+      expect(width("key") + width("value") + 52 + 72).toBeCloseTo(240);
+      resize(600);
+      expect(width("key")).toBe(296);
+      expect(width("value")).toBe(180);
+      const handle = screen.getByRole("separator", { name: "调整 Value 列宽" });
+      fireEvent.keyDown(handle, { key: "ArrowRight", shiftKey: true });
+      expect(width("value")).toBe(190);
+      resize(340);
+      expect(width("value")).toBe(80);
+      resize(600);
+      expect(width("value")).toBe(190);
+      for (let index = 0; index < 30; index++)
+        fireEvent.keyDown(handle, { key: "ArrowRight", shiftKey: true });
+      expect(width("key") + width("value") + 52 + 72).toBeLessThanOrEqual(600);
+    } finally {
+      globalThis.ResizeObserver = OriginalResizeObserver;
+    }
   });
   it("纯文本先预览，无效行默认阻止导入，确认跳过后整批提交", async () => {
     const snapshot = fixture();

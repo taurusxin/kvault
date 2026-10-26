@@ -17,6 +17,8 @@ pub fn id() -> String {
 pub struct Table {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub sort_order: u64,
     pub created_at: u64,
     pub updated_at: u64,
     pub deleted: bool,
@@ -154,6 +156,13 @@ pub fn compare_entry_order(a: &Entry, b: &Entry) -> std::cmp::Ordering {
     a.sort_order
         .cmp(&b.sort_order)
         .then_with(|| b.updated_at.cmp(&a.updated_at))
+        .then_with(|| a.id.cmp(&b.id))
+}
+
+pub fn compare_table_order(a: &Table, b: &Table) -> std::cmp::Ordering {
+    a.sort_order
+        .cmp(&b.sort_order)
+        .then_with(|| a.created_at.cmp(&b.created_at))
         .then_with(|| a.id.cmp(&b.id))
 }
 

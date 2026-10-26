@@ -196,11 +196,33 @@ pub fn duplicates(document: &Document) -> Vec<Conflict> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn table_order_merges_with_independent_record_changes() {
+        let mut base = fixture();
+        let mut second = base.tables[0].clone();
+        second.id = id();
+        second.name = "个人".into();
+        second.sort_order = 2;
+        base.tables.push(second);
+        let mut local = base.clone();
+        local.tables[0].sort_order = 2;
+        local.tables[1].sort_order = 1;
+        let mut remote = base.clone();
+        remote.entries.push(entry(&base.tables[0].id, "remote.key"));
+        let (mut merged, conflicts) = merge(&base, &local, &remote);
+        assert!(conflicts.is_empty());
+        merged
+            .tables
+            .sort_by(crate::vault::model::compare_table_order);
+        assert_eq!(merged.tables[0].id, base.tables[1].id);
+        assert_eq!(merged.entries, remote.entries);
+    }
     fn fixture() -> Document {
         Document {
             tables: vec![Table {
                 id: id(),
                 name: "工作".into(),
+                sort_order: 1,
                 created_at: 1,
                 updated_at: 1,
                 deleted: false,

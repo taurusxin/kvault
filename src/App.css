@@ -138,6 +138,18 @@ body {
   font-size: 13px;
   -webkit-font-smoothing: antialiased;
 }
+* {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+input,
+textarea,
+[contenteditable="true"],
+[contenteditable="true"] * {
+  -webkit-user-select: text;
+  user-select: text;
+}
 button,
 [role="button"] {
   cursor: pointer;
