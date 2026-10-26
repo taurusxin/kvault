@@ -93,7 +93,7 @@ pnpm tauri build
 
 ## 当前范围
 
-当前版本为 **0.1.0**，面向个人文本 KV，目标平台为 Windows、macOS 和 Linux。macOS 已完成本地构建与主要交互验证；Windows、Linux 仍需在对应环境完成构建和窗口验收。
+当前版本为 **0.2.0**，面向个人文本 KV，目标平台为 Windows、macOS 和 Linux。macOS 已完成本地构建与主要交互验证；Windows、Linux 仍需在对应环境完成构建和窗口验收。
 
 首版不包含移动端、附件、多人协作、常规明文导出或签名发布。系统解锁默认关闭；Windows 使用 WebAuthn PRF + AES-256-GCM，需要 API ≥ 8 和支持 PRF 的本机 Hello，不提供旧系统兼容后端。主密码始终可用。本次采用全新 v2 格式，不兼容 v1 保险库和旧版加密备份。
 

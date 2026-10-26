@@ -69,8 +69,8 @@ Node.js 依赖统一使用 pnpm 管理。修改图标后运行 `pnpm icons`，�
 发布前同步更新上述三个文件的版本号，并将 `pnpm-lock.yaml`、`src-tauri/Cargo.lock` 与版本变更一起提交。然后手动创建并推送 tag，例如当前版本：
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 工作流使用自动提供的 `GITHUB_TOKEN`，只在发布 job 授予 `contents: write`，无需配置额外密钥。macOS 使用 [Tauri 文档说明的 ad-hoc 签名](https://v2.tauri.app/distribute/sign/macos/)，未配置 Apple 开发者证书、公证或 Windows 代码签名；这是安装包生成与发布流程，实际平台兼容性仍需单独验收。
